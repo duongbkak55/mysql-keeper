@@ -19,4 +19,4 @@ resources:
 
 images:
   - name: ghcr.io/duongnguyen/mysql-keeper
-    newTag: "v0.1.0"   # Pin to a specific image tag for production.
+    newTag: "v0.2.0"   # Pin to a specific image tag for production.

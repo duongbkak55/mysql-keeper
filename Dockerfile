@@ -22,7 +22,7 @@ RUN GONOSUMDB=* CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 RUN file manager
 
 # Final image — explicitly amd64 platform.
-FROM --platform=linux/amd64 gcr.io/distroless/static:nonroot
+FROM scratch
 
 WORKDIR /
 COPY --from=builder /workspace/manager .
