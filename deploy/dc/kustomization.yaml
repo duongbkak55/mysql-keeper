@@ -1,0 +1,22 @@
+---
+# Kustomize overlay for the DC (primary) Kubernetes cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mysql-keeper-system
+
+resources:
+  - ../../config/crd/bases/mysql.keeper.io_clusterswitchpolicies.yaml
+  - ../../config/rbac/service_account.yaml
+  - ../../config/rbac/role.yaml
+  - ../../config/rbac/role_binding.yaml
+  - ../../config/manager/deployment.yaml
+  - ../../config/samples/clusterswitchpolicy_dc.yaml
+  # Secrets — create these manually or via Vault/ESO before deployment:
+  # - secret-pxc-dc-admin-creds.yaml
+  # - secret-pxc-dr-admin-creds.yaml
+  # - secret-proxysql-dc-admin-creds.yaml
+
+images:
+  - name: ghcr.io/duongnguyen/mysql-keeper
+    newTag: "v0.1.0"   # Pin to a specific image tag for production.

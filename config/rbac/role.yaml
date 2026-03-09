@@ -1,0 +1,36 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mysql-keeper-manager-role
+rules:
+  # ClusterSwitchPolicy CRD — full CRUD + status update.
+  - apiGroups: ["mysql.keeper.io"]
+    resources: ["clusterswitchpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["mysql.keeper.io"]
+    resources: ["clusterswitchpolicies/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["mysql.keeper.io"]
+    resources: ["clusterswitchpolicies/finalizers"]
+    verbs: ["update"]
+
+  # Percona XtraDB Cluster CRD — read + patch spec.pxc.configuration to persist read_only.
+  - apiGroups: ["pxc.percona.com"]
+    resources: ["perconaxtradbclusters"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # Secrets — read credentials for MySQL, ProxySQL admin.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # Events — publish controller events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+  # Leader election — manage Lease objects.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

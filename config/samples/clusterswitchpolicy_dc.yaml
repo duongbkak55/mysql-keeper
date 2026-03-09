@@ -1,0 +1,99 @@
+---
+# ClusterSwitchPolicy for the DC (primary) cluster.
+# Deploy this CR in the DC Kubernetes cluster.
+apiVersion: mysql.keeper.io/v1alpha1
+kind: ClusterSwitchPolicy
+metadata:
+  name: dc-dr-policy
+spec:
+  # This controller manages the DC cluster.
+  clusterRole: dc
+
+  # Local PXC cluster (deployed by Percona XtraDB Operator in the DC cluster).
+  pxcNamespace: percona-xtradb
+  pxcName: pxc-dc
+
+  # The replication channel name in spec.replication.channels[].name of the PerconaXtraDBCluster CRD.
+  # mysql-keeper toggles isSource on this channel to promote/demote this cluster.
+  # Must match the channel name configured on both DC and DR sides.
+  replicationChannelName: dc-to-dr
+
+  # MySQL endpoint for the LOCAL DC PXC cluster.
+  # The controller reads health status and toggles read_only via this endpoint.
+  localMySQL:
+    host: pxc-dc-haproxy.percona-xtradb.svc.cluster.local
+    port: 3306
+    credentialsSecretRef:
+      name: pxc-dc-admin-creds
+      namespace: mysql-keeper-system
+
+  # MySQL endpoint for the REMOTE DR PXC cluster.
+  # This must be a VIP/LoadBalancer IP reachable from the DC network via MySQL port 3306.
+  # The controller uses this to monitor DR health and to promote DR during failover.
+  remoteMySQL:
+    host: 10.20.0.100         # DR cluster's external MySQL endpoint (adjust to your network)
+    port: 3306
+    credentialsSecretRef:
+      name: pxc-dr-admin-creds
+      namespace: mysql-keeper-system
+
+  # Local DC ProxySQL admin endpoints (3 instances).
+  proxySQL:
+    - host: proxysql-0.proxysql-dc.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dc-admin-creds
+        namespace: mysql-keeper-system
+    - host: proxysql-1.proxysql-dc.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dc-admin-creds
+        namespace: mysql-keeper-system
+    - host: proxysql-2.proxysql-dc.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dc-admin-creds
+        namespace: mysql-keeper-system
+
+  healthCheck:
+    interval: 15s              # Run health checks every 15 seconds.
+    failureThreshold: 3        # Declare unhealthy after 3 consecutive failures (~45s).
+    mysqlCheckTimeout: 5s      # Per-query MySQL timeout.
+    proxySQLMinHealthy: 2      # At least 2 of 3 ProxySQL must be reachable.
+
+  switchover:
+    timeout: 5m                # Abort and roll back if switchover exceeds 5 minutes.
+    drainTimeout: 30s          # Wait 30s for connections to drain before fencing.
+    fenceTimeout: 10s          # Max time to attempt fencing (set read_only=ON) on local cluster.
+    readWriteHostgroup: 10     # ProxySQL HG 10 = write traffic.
+    readOnlyHostgroup: 20      # ProxySQL HG 20 = read traffic.
+    # After failover, writes route to the DR cluster via its external MySQL IP.
+    remoteWriterHost: 10.20.0.100   # DR MySQL external endpoint (same as remoteMySQL.host).
+    remoteWriterPort: 3306
+    # The local DC writer entry to demote in ProxySQL.
+    localWriterHost: pxc-dc-haproxy.percona-xtradb.svc.cluster.local
+
+  # MANO API config (recommended). When set, isSource changes on both local and remote
+  # PXC clusters are applied via the MANO LCM API, which then reconciles the CRD.
+  # This prevents the PXC operator from fighting our state change on its next reconcile.
+  mano:
+    host: https://mano.example.com
+    credentialsSecretRef:
+      name: mano-credentials
+      namespace: mysql-keeper-system
+    localCnfName: pxc-dc-cnf        # CNF name of the DC PXC cluster in MANO
+    localVduName: pxc-dc-vdu        # VDU name of the DC PXC cluster in MANO
+    remoteCnfName: pxc-dr-cnf       # CNF name of the DR PXC cluster in MANO
+    remoteVduName: pxc-dr-vdu       # VDU name of the DR PXC cluster in MANO
+    pollInterval: 5s                 # how often to poll lcm-op-occ
+    pollTimeout: 5m                  # max wait for COMPLETED
+
+  # Optional: direct remote k8s API (fallback if MANO is not available).
+  # remoteKubeAPI:
+  #   host: https://10.20.0.10:6443
+  #   tokenSecretRef: { name: dr-kube-token, namespace: mysql-keeper-system }
+  #   pxcNamespace: percona-xtradb
+  #   pxcName: pxc-dr
+
+  # Enable automatic failover. Set to false for manual-only operation.
+  autoFailover: true

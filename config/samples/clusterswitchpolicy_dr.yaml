@@ -1,0 +1,88 @@
+---
+# ClusterSwitchPolicy for the DR (secondary) cluster.
+# Deploy this CR in the DR Kubernetes cluster.
+apiVersion: mysql.keeper.io/v1alpha1
+kind: ClusterSwitchPolicy
+metadata:
+  name: dc-dr-policy
+spec:
+  # This controller manages the DR cluster.
+  clusterRole: dr
+
+  # Local PXC cluster (deployed by Percona XtraDB Operator in the DR cluster).
+  pxcNamespace: percona-xtradb
+  pxcName: pxc-dr
+
+  # The replication channel name in spec.replication.channels[].name of the PerconaXtraDBCluster CRD.
+  # Must match the channel name configured on both DC and DR sides.
+  replicationChannelName: dc-to-dr
+
+  # MySQL endpoint for the LOCAL DR PXC cluster.
+  localMySQL:
+    host: pxc-dr-haproxy.percona-xtradb.svc.cluster.local
+    port: 3306
+    credentialsSecretRef:
+      name: pxc-dr-admin-creds
+      namespace: mysql-keeper-system
+
+  # MySQL endpoint for the REMOTE DC PXC cluster.
+  # Must be a VIP/LoadBalancer IP reachable from the DR network.
+  remoteMySQL:
+    host: 10.10.0.100         # DC cluster's external MySQL endpoint (adjust to your network)
+    port: 3306
+    credentialsSecretRef:
+      name: pxc-dc-admin-creds
+      namespace: mysql-keeper-system
+
+  # Local DR ProxySQL admin endpoints (3 instances).
+  proxySQL:
+    - host: proxysql-0.proxysql-dr.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dr-admin-creds
+        namespace: mysql-keeper-system
+    - host: proxysql-1.proxysql-dr.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dr-admin-creds
+        namespace: mysql-keeper-system
+    - host: proxysql-2.proxysql-dr.percona-xtradb.svc.cluster.local
+      adminPort: 6032
+      credentialsSecretRef:
+        name: proxysql-dr-admin-creds
+        namespace: mysql-keeper-system
+
+  healthCheck:
+    interval: 15s
+    failureThreshold: 3
+    mysqlCheckTimeout: 5s
+    proxySQLMinHealthy: 2
+
+  switchover:
+    timeout: 5m
+    drainTimeout: 30s
+    fenceTimeout: 10s
+    readWriteHostgroup: 10
+    readOnlyHostgroup: 20
+    # After failover (DR becomes primary), writes stay on local DR PXC.
+    remoteWriterHost: pxc-dr-haproxy.percona-xtradb.svc.cluster.local
+    remoteWriterPort: 3306
+    # The DC writer entry in ProxySQL (originally pointing to DC) to demote.
+    localWriterHost: 10.10.0.100   # DC MySQL external endpoint (same as remoteMySQL.host).
+
+  # MANO API config — same MANO instance as the DC side.
+  # localCnfName/localVduName = DR cluster CNF; remoteCnfName/remoteVduName = DC cluster CNF.
+  # The DR controller calls MANO to toggle isSource for both DR (local) and DC (remote).
+  mano:
+    host: https://mano.example.com
+    credentialsSecretRef:
+      name: mano-credentials
+      namespace: mysql-keeper-system
+    localCnfName: pxc-dr-cnf        # CNF name of the DR PXC cluster in MANO
+    localVduName: pxc-dr-vdu
+    remoteCnfName: pxc-dc-cnf       # CNF name of the DC PXC cluster in MANO
+    remoteVduName: pxc-dc-vdu
+    pollInterval: 5s
+    pollTimeout: 5m
+
+  autoFailover: true
