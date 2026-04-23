@@ -1,0 +1,201 @@
+# PrometheusRule manifests for mysql-keeper. Apply alongside the controller
+# deployment via kustomize (see config/observability/kustomization.yaml) or as
+# standalone kubectl apply when the Prometheus Operator is installed.
+#
+# Every alert is tied back to a scenario from the production-readiness review
+# (see mysql-keeper-production-review.md, section 5.2) and labeled with a
+# runbook hint. Severities follow PagerDuty conventions:
+#
+#   critical  -> page oncall immediately
+#   warning   -> route to team chat / email; actionable during business hours
+#   info      -> dashboard only
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mysql-keeper-rules
+  namespace: mysql-keeper-system
+  labels:
+    app.kubernetes.io/name: mysql-keeper
+    app.kubernetes.io/component: observability
+    release: prometheus        # adjust to match your Prometheus Operator release label
+spec:
+  groups:
+    - name: mysql-keeper.safety
+      interval: 30s
+      rules:
+        - alert: MysqlKeeperBothClustersReadOnly
+          # The exact scenario that triggered the production incident: both DC
+          # and DR became read_only. Auto-failover has been suppressed by the
+          # controller guard; a human must diagnose the quorum loss.
+          expr: |
+            increase(mysql_keeper_both_clusters_readonly_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            team: dbre
+          annotations:
+            summary: "Both DC and DR are ReadOnly"
+            description: |
+              mysql-keeper observed both clusters in read_only=ON state,
+              which is typically a cluster-wide quorum loss on PXC rather
+              than a failover scenario. Auto-failover is suppressed — manual
+              investigation required. See runbook 6.2 in the production-
+              readiness review.
+
+        - alert: MysqlKeeperBothClustersWritable
+          # Split-brain writer — the most dangerous state. Pages immediately.
+          expr: |
+            sum by (cluster_role) (mysql_keeper_cluster_writable) > 1
+            or increase(mysql_keeper_both_clusters_writable_total[2m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: dbre
+          annotations:
+            summary: "Split-brain writer detected (both clusters writable)"
+            description: |
+              Both DC and DR have read_only=OFF simultaneously. This indicates
+              a split-brain condition — clients may write to either side and
+              the two GTID streams will diverge. Fence the wrong side
+              immediately. See runbook 6.2.
+
+    - name: mysql-keeper.replication
+      interval: 30s
+      rules:
+        - alert: MysqlKeeperReplicationIOBroken
+          expr: mysql_keeper_replication_channel_io_running == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: dbre
+          annotations:
+            summary: "Replication IO thread down on {{ $labels.scope }} cluster"
+            description: |
+              The replication receiver for channel {{ $labels.channel }} has
+              been down for 2m. A switchover would leave gaps. Check
+              SHOW REPLICA STATUS and error log on the affected cluster.
+
+        - alert: MysqlKeeperReplicationSQLBroken
+          expr: mysql_keeper_replication_channel_sql_running == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: dbre
+          annotations:
+            summary: "Replication SQL applier down on {{ $labels.scope }} cluster"
+            description: |
+              The replication applier for channel {{ $labels.channel }} has
+              been down for 2m. Downstream is falling behind; a promotion
+              right now will lose those GTIDs.
+
+        - alert: MysqlKeeperBinlogRetentionLow
+          # Directly targets the scenario that caused the GTID purged incident.
+          expr: mysql_keeper_binlog_expire_logs_seconds < 86400
+          for: 10m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "binlog_expire_logs_seconds < 1 day on {{ $labels.scope }}"
+            description: |
+              Binlog retention is under 24h. Any outage on the other side
+              longer than retention will cause Error 1236 at resync. Raise
+              to 7+ days in production.
+
+    - name: mysql-keeper.switchover
+      interval: 30s
+      rules:
+        - alert: MysqlKeeperSwitchoverStuck
+          # SwitchoverProgress has not advanced; the reconciler is expected
+          # to abandon it after ResumeStuckTimeout and mark Degraded.
+          expr: |
+            max by (cluster_role) (
+              kube_customresource_mysql_keeper_ready_duration_seconds{phase="SwitchingOver"}
+            ) > 900
+          for: 0m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "Switchover stuck > 15m — controller may require intervention"
+            description: |
+              The CR has been in SwitchingOver longer than ResumeStuckTimeout.
+              Check kubectl describe clusterswitchpolicy and controller logs.
+
+        - alert: MysqlKeeperSwitchoverFailures
+          expr: |
+            rate(mysql_keeper_switchover_total{result=~"failure|rollback"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "Switchover failures on {{ $labels.cluster_role }}"
+            description: |
+              One or more switchover attempts have failed in the last 15m.
+              Check SwitchoverProgress.failedPhase on the CR and inspect
+              PreFlight results to see which check blocked it.
+
+        - alert: MysqlKeeperManualInterventionRequired
+          expr: |
+            increase(mysql_keeper_manual_intervention_required_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            team: dbre
+          annotations:
+            summary: "mysql-keeper requests manual intervention ({{ $labels.phase }})"
+            description: |
+              The controller has given up on automatic resolution and set the
+              CR to Degraded. See runbook 6.1 for the recovery procedure.
+
+        - alert: MysqlKeeperFenceFailures
+          expr: |
+            rate(mysql_keeper_fence_failures_total[10m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "Fencing failures on {{ $labels.cluster_role }} via {{ $labels.path }}"
+
+        - alert: MysqlKeeperPreFlightRegression
+          expr: |
+            increase(mysql_keeper_preflight_failures_total{phase="PreFlight"}[30m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "PreFlight gate blocked a switchover"
+            description: |
+              A switchover attempt was rejected by the preflight checklist.
+              Inspect Status.LastPreFlight on the CR to see which check
+              failed (GTID subset, replication health, log_replica_updates,
+              binlog retention, etc.).
+
+    - name: mysql-keeper.health
+      interval: 30s
+      rules:
+        - alert: MysqlKeeperClusterUnhealthy
+          expr: |
+            mysql_keeper_cluster_healthy == 0
+          for: 5m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "mysql-keeper reports {{ $labels.scope }} cluster unhealthy"
+
+        - alert: MysqlKeeperProxySQLDegraded
+          expr: |
+            mysql_keeper_proxysql_healthy_instances < 2
+          for: 3m
+          labels:
+            severity: warning
+            team: dbre
+          annotations:
+            summary: "ProxySQL healthy instances = {{ $value }} on {{ $labels.cluster_role }}"
+            description: |
+              Fewer than 2 ProxySQL admin ports are responding; a failover
+              routing change may not reach all instances consistently.

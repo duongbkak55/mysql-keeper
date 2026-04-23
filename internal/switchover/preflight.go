@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
@@ -117,6 +119,7 @@ type PreFlight struct {
 // deliberate: we want the status subresource to show every issue in a single
 // reconcile, not just the first.
 func (p PreFlight) Run(ctx context.Context) *PreFlightResult {
+	logger := log.FromContext(ctx).WithValues("event", "preflight")
 	res := &PreFlightResult{}
 
 	res.Checks = append(res.Checks, p.checkRemoteReachableReadOnly(ctx))
@@ -131,6 +134,16 @@ func (p PreFlight) Run(ctx context.Context) *PreFlightResult {
 	res.Checks = append(res.Checks, p.checkGTIDMode(ctx))
 	res.Checks = append(res.Checks, p.checkBinlogFormat(ctx))
 	res.Checks = append(res.Checks, p.checkBinlogRetention(ctx))
+
+	for _, c := range res.Checks {
+		logger.Info("preflight check",
+			"check", c.Name,
+			"severity", c.Severity.String(),
+			"passed", c.Passed,
+			"elapsed_ms", c.Elapsed.Milliseconds(),
+			"message", c.Message,
+		)
+	}
 
 	return res
 }

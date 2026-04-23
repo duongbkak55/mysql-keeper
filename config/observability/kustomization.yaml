@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Overlay this folder on top of a base that already has the controller running.
+# Example: kubectl apply -k config/observability/
+resources:
+  - prometheus_rules.yaml
+  - servicemonitor.yaml

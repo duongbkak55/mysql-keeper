@@ -44,6 +44,12 @@ func newProgressReporter(c ctrlclient.Client, key ctrlclient.ObjectKey, attemptI
 }
 
 func (p *progressReporter) OnPhaseStart(ctx context.Context, phase switchover.Phase) {
+	log.FromContext(ctx).Info("phase_transition",
+		"event", "phase_transition",
+		"attemptID", p.attemptID,
+		"phase", phase.String(),
+		"state", "start",
+	)
 	p.writeProgress(ctx, phase.String(), "", "", p.snapshotCompleted())
 }
 
@@ -53,6 +59,12 @@ func (p *progressReporter) OnPhaseComplete(ctx context.Context, phase switchover
 	completed := append([]string(nil), p.completed...)
 	p.mu.Unlock()
 
+	log.FromContext(ctx).Info("phase_transition",
+		"event", "phase_transition",
+		"attemptID", p.attemptID,
+		"phase", phase.String(),
+		"state", "complete",
+	)
 	p.writeProgress(ctx, phase.String(), "", "", completed)
 }
 
@@ -61,6 +73,13 @@ func (p *progressReporter) OnPhaseError(ctx context.Context, phase switchover.Ph
 	if err != nil {
 		errMsg = err.Error()
 	}
+	log.FromContext(ctx).Info("phase_transition",
+		"event", "phase_transition",
+		"attemptID", p.attemptID,
+		"phase", phase.String(),
+		"state", "error",
+		"error", errMsg,
+	)
 	p.writeProgress(ctx, phase.String(), phase.String(), errMsg, p.snapshotCompleted())
 }
 

@@ -231,10 +231,16 @@ func NewEngine(cfg Config) *Engine {
 // phases that were already applied, in reverse order.
 func (e *Engine) Execute(ctx context.Context) Result {
 	logger := log.FromContext(ctx).WithValues(
+		"event", "switchover",
 		"reason", e.cfg.Reason,
 		"attemptID", e.cfg.AttemptID,
+		"channel", e.cfg.ReplicationChannel,
 	)
-	logger.Info("Starting switchover")
+	start := time.Now()
+	logger.Info("switchover started")
+	defer func() {
+		logger.Info("switchover finished", "elapsed_ms", time.Since(start).Milliseconds())
+	}()
 
 	reporter := e.cfg.Progress
 	if reporter == nil {

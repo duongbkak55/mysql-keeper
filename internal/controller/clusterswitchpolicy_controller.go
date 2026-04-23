@@ -153,6 +153,7 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	remoteHealth := comps.remoteChecker.Check(ctx)
 
 	r.updateMetrics(policy, localHealth, remoteHealth)
+	r.observeReplicationMetrics(ctx, policy, comps)
 
 	// Persist the counters/health derived from this cycle before any further
 	// branching. We keep the merge base cloned before we mutate the status so
@@ -183,6 +184,16 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	reason, shouldSwitch := r.decideSwitchover(ctx, policy, comps, localHealth, remoteHealth)
+	logger.Info("should_switchover",
+		"event", "should_switchover",
+		"result", shouldSwitch,
+		"reason", reason,
+		"localHealthy", localHealth.Healthy,
+		"remoteHealthy", remoteHealth.Healthy,
+		"localWritable", localHealth.Writable.String(),
+		"remoteWritable", remoteHealth.Writable.String(),
+		"consecutiveLocalFailures", policy.Status.ConsecutiveLocalFailures,
+	)
 	if !shouldSwitch {
 		if policy.Status.Phase != mysqlv1alpha1.PhaseSwitchingOver {
 			patch := client.MergeFrom(policy.DeepCopy())

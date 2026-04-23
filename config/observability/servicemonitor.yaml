@@ -1,0 +1,25 @@
+# ServiceMonitor for the mysql-keeper controller metrics endpoint.
+# Assumes a service named "mysql-keeper-metrics" in mysql-keeper-system that
+# exposes the /metrics port (8080 by default) from the controller pods.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mysql-keeper
+  namespace: mysql-keeper-system
+  labels:
+    app.kubernetes.io/name: mysql-keeper
+    app.kubernetes.io/component: observability
+    release: prometheus        # adjust to match your Prometheus Operator release label
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysql-keeper
+  namespaceSelector:
+    matchNames:
+      - mysql-keeper-system
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+      scheme: http
+      honorLabels: true
