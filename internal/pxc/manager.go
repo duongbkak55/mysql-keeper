@@ -11,6 +11,7 @@ package pxc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -103,12 +104,19 @@ func (m *Manager) SetReadWrite(ctx context.Context) error {
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
-	// Verify Galera is in Primary state before promoting.
+	// Verify Galera is in Primary state before promoting. When the server is
+	// plain MySQL (standalone Percona Server, a test container, etc.) the
+	// wsrep status variables do not exist and SHOW STATUS returns an empty
+	// set. In that case we log and continue — the wsrep check is a PXC-
+	// specific guard, not a generic correctness requirement.
 	var varName, wsrepStatus string
-	if err := db.QueryRowContext(qCtx, "SHOW STATUS LIKE 'wsrep_cluster_status'").Scan(&varName, &wsrepStatus); err != nil {
+	err = db.QueryRowContext(qCtx, "SHOW STATUS LIKE 'wsrep_cluster_status'").Scan(&varName, &wsrepStatus)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		logger.Info("wsrep_cluster_status is absent — assuming non-PXC MySQL and skipping Galera primary check")
+	case err != nil:
 		return fmt.Errorf("query wsrep_cluster_status: %w", err)
-	}
-	if wsrepStatus != "Primary" {
+	case wsrepStatus != "Primary":
 		return fmt.Errorf("cannot promote: wsrep_cluster_status=%q (must be 'Primary')", wsrepStatus)
 	}
 
