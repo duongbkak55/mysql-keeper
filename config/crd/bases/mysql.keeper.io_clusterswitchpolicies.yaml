@@ -2,203 +2,793 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: clusterswitchpolicies.mysql.keeper.io
   annotations:
     controller-gen.kubebuilder.io/version: v0.14.0
+  name: clusterswitchpolicies.mysql.keeper.io
 spec:
   group: mysql.keeper.io
   names:
     kind: ClusterSwitchPolicy
     listKind: ClusterSwitchPolicyList
     plural: clusterswitchpolicies
-    singular: clusterswitchpolicy
     shortNames:
-      - csp
+    - csp
+    singular: clusterswitchpolicy
   scope: Cluster
   versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      subresources:
-        status: {}
-      additionalPrinterColumns:
-        - name: Role
-          type: string
-          jsonPath: .spec.clusterRole
-        - name: Active
-          type: string
-          jsonPath: .status.activeCluster
-        - name: Phase
-          type: string
-          jsonPath: .status.phase
-        - name: Age
-          type: date
-          jsonPath: .metadata.creationTimestamp
-      schema:
-        openAPIV3Schema:
-          type: object
-          description: ClusterSwitchPolicy configures DC-DR MySQL automatic switchover.
-          properties:
-            apiVersion:
-              type: string
-            kind:
-              type: string
-            metadata:
-              type: object
-            spec:
-              type: object
-              required:
-                - clusterRole
-                - pxcNamespace
-                - pxcName
-                - localMySQL
-                - remoteMySQL
-                - proxySQL
-                - healthCheck
-                - switchover
-              properties:
-                clusterRole:
-                  type: string
-                  enum: ["dc", "dr"]
-                  description: "Whether this controller manages the 'dc' or 'dr' cluster."
-                pxcNamespace:
-                  type: string
-                  description: "Namespace of the local PerconaXtraDBCluster resource."
-                pxcName:
-                  type: string
-                  description: "Name of the local PerconaXtraDBCluster resource."
-                autoFailover:
-                  type: boolean
-                  default: true
-                  description: "Enable automatic failover when local cluster is unhealthy."
-                manualSwitchoverTarget:
-                  type: string
-                  enum: ["", "promote-remote"]
-                  description: "Set to 'promote-remote' to trigger a planned switchover."
-                localMySQL:
-                  type: object
-                  description: "MySQL endpoint for the local PXC cluster."
-                  required: ["host", "credentialsSecretRef"]
-                  properties:
-                    host:
-                      type: string
-                    port:
-                      type: integer
-                      default: 3306
-                    credentialsSecretRef:
-                      type: object
-                      required: ["name"]
-                      properties:
-                        name:
-                          type: string
-                        namespace:
-                          type: string
-                remoteMySQL:
-                  type: object
-                  description: "MySQL endpoint for the remote cluster (cross-cluster reachable)."
-                  required: ["host", "credentialsSecretRef"]
-                  properties:
-                    host:
-                      type: string
-                    port:
-                      type: integer
-                      default: 3306
-                    credentialsSecretRef:
-                      type: object
-                      required: ["name"]
-                      properties:
-                        name:
-                          type: string
-                        namespace:
-                          type: string
-                proxySQL:
-                  type: array
-                  description: "Local ProxySQL admin endpoints."
-                  items:
-                    type: object
-                    required: ["host", "credentialsSecretRef"]
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterRole
+      name: Role
+      type: string
+    - jsonPath: .status.activeCluster
+      name: Active
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterSwitchPolicy configures and tracks DC-DR MySQL automatic switchover.
+          Deploy one instance per Kubernetes cluster (DC and DR each get their own CR).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterSwitchPolicySpec defines the desired configuration
+              for the switchover controller.
+            properties:
+              allowDataLossFailover:
+                default: false
+                description: |-
+                  AllowDataLossFailover is an explicit opt-in for promoting a replica when
+                  the local cluster is destroyed and the preflight GTID subset check
+                  therefore cannot run. The operator must understand that some recent
+                  writes on the former source may be lost.
+                type: boolean
+              autoFailover:
+                default: true
+                description: |-
+                  AutoFailover enables automatic promotion when the local cluster fails.
+                  When true, this controller will promote the remote cluster if local fails.
+                type: boolean
+              clusterRole:
+                description: ClusterRole defines whether this controller instance
+                  manages the "dc" or "dr" cluster.
+                enum:
+                - dc
+                - dr
+                type: string
+              healthCheck:
+                description: HealthCheck defines thresholds and intervals for health
+                  monitoring.
+                properties:
+                  failureThreshold:
+                    default: 3
+                    description: |-
+                      FailureThreshold is the number of consecutive failed checks before
+                      a cluster is declared unhealthy and failover is considered.
+                    format: int32
+                    type: integer
+                  interval:
+                    default: 15s
+                    description: Interval between consecutive health check cycles.
+                    type: string
+                  mysqlCheckTimeout:
+                    default: 5s
+                    description: MySQLCheckTimeout is the per-query timeout for direct
+                      MySQL health checks.
+                    type: string
+                  proxySQLMinHealthy:
+                    default: 2
+                    description: |-
+                      ProxySQLMinHealthy is the minimum number of local ProxySQL instances
+                      that must be reachable to consider ProxySQL healthy.
+                    format: int32
+                    type: integer
+                required:
+                - failureThreshold
+                - interval
+                - mysqlCheckTimeout
+                - proxySQLMinHealthy
+                type: object
+              localMySQL:
+                description: |-
+                  LocalMySQL lists direct MySQL endpoints for the local PXC cluster nodes.
+                  Used for health checks and read_only toggle on the local cluster.
+                properties:
+                  credentialsSecretRef:
+                    description: |-
+                      CredentialsSecretRef refers to a Secret with "username" and "password" keys.
+                      The user must have SUPER (or SYSTEM_VARIABLES_ADMIN) privilege.
                     properties:
-                      host:
+                      name:
+                        description: Name of the Secret.
                         type: string
-                      adminPort:
-                        type: integer
-                        default: 6032
-                      credentialsSecretRef:
-                        type: object
-                        required: ["name"]
-                        properties:
-                          name:
-                            type: string
-                          namespace:
-                            type: string
-                healthCheck:
-                  type: object
-                  properties:
-                    interval:
-                      type: string
-                      default: "15s"
-                    failureThreshold:
-                      type: integer
-                      default: 3
-                    mysqlCheckTimeout:
-                      type: string
-                      default: "5s"
-                    proxySQLMinHealthy:
-                      type: integer
-                      default: 2
-                switchover:
-                  type: object
-                  required: ["remoteWriterHost", "localWriterHost"]
-                  properties:
-                    timeout:
-                      type: string
-                      default: "5m"
-                    drainTimeout:
-                      type: string
-                      default: "30s"
-                    fenceTimeout:
-                      type: string
-                      default: "10s"
-                    readWriteHostgroup:
-                      type: integer
-                      default: 10
-                    readOnlyHostgroup:
-                      type: integer
-                      default: 20
-                    remoteWriterHost:
-                      type: string
-                    remoteWriterPort:
-                      type: integer
-                      default: 3306
-                    localWriterHost:
-                      type: string
-            status:
-              type: object
-              properties:
-                activeCluster:
-                  type: string
-                  enum: ["dc", "dr"]
-                phase:
-                  type: string
-                consecutiveLocalFailures:
-                  type: integer
-                consecutiveRemoteFailures:
-                  type: integer
-                lastSwitchoverTime:
-                  type: string
-                  format: date-time
-                lastSwitchoverReason:
-                  type: string
-                localHealth:
-                  type: object
-                  x-kubernetes-preserve-unknown-fields: true
-                remoteHealth:
-                  type: object
-                  x-kubernetes-preserve-unknown-fields: true
-                conditions:
-                  type: array
-                  items:
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
                     type: object
-                    x-kubernetes-preserve-unknown-fields: true
-                observedGeneration:
-                  type: integer
+                  host:
+                    description: Host is the hostname or IP of the MySQL endpoint
+                      (VIP, LoadBalancer, or HAProxy).
+                    type: string
+                  port:
+                    default: 3306
+                    description: Port is the MySQL port. Defaults to 3306.
+                    format: int32
+                    type: integer
+                required:
+                - credentialsSecretRef
+                - host
+                - port
+                type: object
+              mano:
+                description: |-
+                  MANO configures the MANO (Management and Orchestration) API used to toggle
+                  isSource on both the local and remote PerconaXtraDBCluster CNFs.
+                  When provided, isSource changes are applied via the MANO LCM API instead of
+                  direct k8s API calls. MANO then reconciles the CRD and enforces MySQL state.
+                  Optional: if omitted, falls back to direct k8s API (RemoteKubeAPI) or SQL only.
+                properties:
+                  credentialsSecretRef:
+                    description: |-
+                      CredentialsSecretRef refers to a Secret with "username" and "password" keys for MANO login.
+                      The client calls POST /users/auth to obtain and auto-refresh Bearer tokens.
+                      Mutually exclusive with TokenSecretRef.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  host:
+                    description: Host is the MANO API base URL (e.g. "https://mano.example.com").
+                    type: string
+                  localCnfName:
+                    description: LocalCNFName is the CNF name of the local PerconaXtraDBCluster
+                      in MANO.
+                    type: string
+                  localVduName:
+                    description: LocalVDUName is the VDU name of the local PerconaXtraDBCluster
+                      in MANO.
+                    type: string
+                  pollInterval:
+                    default: 5s
+                    description: PollInterval is how often to poll lcm-op-occ for
+                      the operation result.
+                    type: string
+                  pollTimeout:
+                    default: 5m
+                    description: PollTimeout is the maximum time to wait for a MANO
+                      LCM operation to complete.
+                    type: string
+                  remoteCnfName:
+                    description: RemoteCNFName is the CNF name of the remote PerconaXtraDBCluster
+                      in MANO.
+                    type: string
+                  remoteVduName:
+                    description: RemoteVDUName is the VDU name of the remote PerconaXtraDBCluster
+                      in MANO.
+                    type: string
+                  tokenSecretRef:
+                    description: |-
+                      TokenSecretRef refers to a Secret with a "token" key containing a static Bearer token.
+                      Mutually exclusive with CredentialsSecretRef. If both are set, CredentialsSecretRef takes precedence.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - host
+                - localCnfName
+                - localVduName
+                - remoteCnfName
+                - remoteVduName
+                type: object
+              manualSwitchoverTarget:
+                description: |-
+                  ManualSwitchoverTarget triggers a planned switchover when set to "promote-remote".
+                  The controller clears this field after the switchover completes.
+                enum:
+                - ""
+                - promote-remote
+                type: string
+              preFlight:
+                description: |-
+                  PreFlight carries knobs that govern the preflight checklist executed
+                  before a switchover is allowed to proceed. Defaults are production-safe.
+                properties:
+                  catchupTimeout:
+                    default: 30s
+                    description: |-
+                      CatchupTimeout is how long the preflight may wait for the replica to
+                      apply every GTID the source has. Default 30 seconds.
+                    type: string
+                  minBinlogRetentionSeconds:
+                    default: 604800
+                    description: |-
+                      MinBinlogRetentionSeconds is the minimum binlog_expire_logs_seconds
+                      accepted on both sides. The C11 check surfaces a soft warning when this
+                      threshold is not met. Default 604800 (7 days).
+                    format: int64
+                    type: integer
+                type: object
+              proxySQL:
+                description: ProxySQL lists the local ProxySQL admin endpoints (typically
+                  3 instances).
+                items:
+                  description: ProxySQLEndpoint defines a single ProxySQL admin interface.
+                  properties:
+                    adminPort:
+                      default: 6032
+                      description: AdminPort is the ProxySQL admin interface port.
+                      format: int32
+                      type: integer
+                    credentialsSecretRef:
+                      description: CredentialsSecretRef refers to a Secret with "username"
+                        and "password" for ProxySQL admin.
+                      properties:
+                        name:
+                          description: Name of the Secret.
+                          type: string
+                        namespace:
+                          description: Namespace of the Secret. Defaults to the controller's
+                            namespace if omitted.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    host:
+                      description: Host is the DNS name or IP of the ProxySQL instance.
+                      type: string
+                  required:
+                  - adminPort
+                  - credentialsSecretRef
+                  - host
+                  type: object
+                type: array
+              pxcName:
+                description: PXCName is the name of the local PerconaXtraDBCluster
+                  resource.
+                type: string
+              pxcNamespace:
+                description: PXCNamespace is the namespace where the local PerconaXtraDBCluster
+                  resource lives.
+                type: string
+              remoteKubeAPI:
+                description: |-
+                  RemoteKubeAPI configures access to the remote cluster's Kubernetes API server.
+                  When provided, the local controller also patches the remote PerconaXtraDBCluster CRD
+                  (isSource field) directly after SQL state changes, preventing the remote PXC operator
+                  from fighting our state change on its next reconcile cycle.
+                  Optional: if omitted, only SQL-based state changes are made to the remote cluster.
+                properties:
+                  caSecretRef:
+                    description: |-
+                      CASecretRef refers to a Secret with a "ca.crt" key containing the TLS CA
+                      certificate for the remote k8s API server. Omit to skip TLS verification.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  host:
+                    description: Host is the remote k8s API server URL (e.g. "https://10.10.0.1:6443").
+                    type: string
+                  pxcName:
+                    description: PXCName is the name of the remote PerconaXtraDBCluster
+                      resource.
+                    type: string
+                  pxcNamespace:
+                    description: PXCNamespace is the namespace of the remote PerconaXtraDBCluster
+                      resource.
+                    type: string
+                  tokenSecretRef:
+                    description: |-
+                      TokenSecretRef refers to a Secret with a "token" key containing a
+                      ServiceAccount bearer token that has patch/update permissions on
+                      PerconaXtraDBCluster resources in the remote cluster.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - host
+                - pxcName
+                - pxcNamespace
+                - tokenSecretRef
+                type: object
+              remoteMySQL:
+                description: |-
+                  RemoteMySQL is the MySQL endpoint of the remote cluster (cross-cluster reachable).
+                  Used for health monitoring and promoting/fencing the remote cluster.
+                properties:
+                  credentialsSecretRef:
+                    description: |-
+                      CredentialsSecretRef refers to a Secret with "username" and "password" keys.
+                      The user must have SUPER (or SYSTEM_VARIABLES_ADMIN) privilege.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  host:
+                    description: Host is the hostname or IP of the MySQL endpoint
+                      (VIP, LoadBalancer, or HAProxy).
+                    type: string
+                  port:
+                    default: 3306
+                    description: Port is the MySQL port. Defaults to 3306.
+                    format: int32
+                    type: integer
+                required:
+                - credentialsSecretRef
+                - host
+                - port
+                type: object
+              replicationChannelName:
+                description: |-
+                  ReplicationChannelName is the name of the replication channel in spec.replication.channels[]
+                  that this controller toggles (isSource=true/false) to control the cluster's writer role.
+                  Must match the channel name configured in the PerconaXtraDBCluster CRD on both sites.
+                type: string
+              switchover:
+                description: Switchover defines parameters for the switchover operation.
+                properties:
+                  blackholeHostgroup:
+                    default: 9999
+                    description: |-
+                      BlackholeHostgroup is the ProxySQL hostgroup used by the alternate fence
+                      path when the SQL fence fails and the local cluster is unreachable.
+                      Default 9999 (an ID no query rules route to).
+                    format: int32
+                    type: integer
+                  cooldownPeriod:
+                    default: 10m
+                    description: |-
+                      CooldownPeriod is the minimum interval between two successive switchovers.
+                      Protects against ping-pong when a transient incident causes both sides to
+                      flap. Default 10 minutes.
+                    type: string
+                  drainTimeout:
+                    default: 30s
+                    description: |-
+                      DrainTimeout is how long to wait for existing connections to drain on the
+                      local (being demoted) cluster before proceeding with fencing.
+                    type: string
+                  fenceTimeout:
+                    default: 10s
+                    description: FenceTimeout is the timeout for the fencing (set
+                      read_only=ON) operation.
+                    type: string
+                  localWriterHost:
+                    description: |-
+                      LocalWriterHost is the MySQL host of this cluster's PXC (used to identify
+                      the current writer entry in ProxySQL to be demoted).
+                    type: string
+                  readOnlyHostgroup:
+                    default: 20
+                    description: ReadOnlyHostgroup is the ProxySQL hostgroup ID for
+                      read traffic.
+                    format: int32
+                    type: integer
+                  readWriteHostgroup:
+                    default: 10
+                    description: ReadWriteHostgroup is the ProxySQL hostgroup ID for
+                      write traffic.
+                    format: int32
+                    type: integer
+                  remoteWriterHost:
+                    description: |-
+                      RemoteWriterHost is the MySQL host (of the remote cluster) that ProxySQL should
+                      route write traffic to after failover. This should be the remote cluster's
+                      VIP or LoadBalancer address reachable from this cluster's ProxySQL instances.
+                    type: string
+                  remoteWriterPort:
+                    default: 3306
+                    description: RemoteWriterPort is the MySQL port for the remote
+                      writer.
+                    format: int32
+                    type: integer
+                  resumeStuckTimeout:
+                    default: 10m
+                    description: |-
+                      ResumeStuckTimeout is how long a "SwitchingOver" phase may remain in the
+                      middle of a checkpoint before the controller abandons it and transitions
+                      to Degraded. Default 10 minutes.
+                    type: string
+                  timeout:
+                    default: 5m
+                    description: Timeout is the maximum duration for a complete switchover
+                      before rollback.
+                    type: string
+                required:
+                - drainTimeout
+                - fenceTimeout
+                - localWriterHost
+                - readOnlyHostgroup
+                - readWriteHostgroup
+                - remoteWriterHost
+                - remoteWriterPort
+                - timeout
+                type: object
+            required:
+            - autoFailover
+            - clusterRole
+            - healthCheck
+            - localMySQL
+            - proxySQL
+            - pxcName
+            - pxcNamespace
+            - remoteMySQL
+            - replicationChannelName
+            - switchover
+            type: object
+          status:
+            description: ClusterSwitchPolicyStatus reflects the observed state of
+              the controller.
+            properties:
+              activeCluster:
+                description: 'ActiveCluster indicates which cluster currently holds
+                  write role: "dc" or "dr".'
+                enum:
+                - dc
+                - dr
+                type: string
+              conditions:
+                description: Conditions provides detailed status conditions.
+                items:
+                  description: "Condition contains details for one aspect of the current
+                    state of this API Resource.\n---\nThis struct is intended for
+                    direct use as an array at the field path .status.conditions.  For
+                    example,\n\n\n\ttype FooStatus struct{\n\t    // Represents the
+                    observations of a foo's current state.\n\t    // Known .status.conditions.type
+                    are: \"Available\", \"Progressing\", and \"Degraded\"\n\t    //
+                    +patchMergeKey=type\n\t    // +patchStrategy=merge\n\t    // +listType=map\n\t
+                    \   // +listMapKey=type\n\t    Conditions []metav1.Condition `json:\"conditions,omitempty\"
+                    patchStrategy:\"merge\" patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`\n\n\n\t
+                    \   // other fields\n\t}"
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: |-
+                        type of condition in CamelCase or in foo.example.com/CamelCase.
+                        ---
+                        Many .condition.type values are consistent across resources like Available, but because arbitrary conditions can be
+                        useful (see .node.status.conditions), the ability to deconflict is important.
+                        The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              consecutiveLocalFailures:
+                description: ConsecutiveLocalFailures tracks consecutive health check
+                  failures for the local cluster.
+                format: int32
+                type: integer
+              consecutiveLocalUnreachable:
+                description: |-
+                  ConsecutiveLocalUnreachable counts how many successive health check cycles
+                  were unable to reach the local cluster at all (vs. reached but unhealthy).
+                  Unreachability alone must not trigger a failover; the counter is kept
+                  separately so operators can alert on this independently.
+                format: int32
+                type: integer
+              consecutiveRemoteFailures:
+                description: ConsecutiveRemoteFailures tracks consecutive health check
+                  failures for the remote cluster.
+                format: int32
+                type: integer
+              lastPreFlight:
+                description: |-
+                  LastPreFlight holds the checklist result of the most recent switchover
+                  attempt (successful or not), so operators can see which checks passed
+                  and which blocked the flip without reading controller logs.
+                properties:
+                  checks:
+                    description: Checks captures each C-level check result.
+                    items:
+                      description: PreFlightCheck is a single row from the preflight
+                        checklist.
+                      properties:
+                        message:
+                          type: string
+                        name:
+                          type: string
+                        passed:
+                          type: boolean
+                        severity:
+                          type: string
+                      required:
+                      - name
+                      - passed
+                      - severity
+                      type: object
+                    type: array
+                  localGTIDExecuted:
+                    description: |-
+                      LocalGTIDExecuted / RemoteGTIDExecuted snapshot the GTID positions that
+                      drove the subset / catch-up decisions.
+                    type: string
+                  passedAt:
+                    description: PassedAt is when this preflight snapshot was collected.
+                    format: date-time
+                    type: string
+                  remoteGTIDExecuted:
+                    type: string
+                required:
+                - passedAt
+                type: object
+              lastSwitchoverReason:
+                description: LastSwitchoverReason is a human-readable description
+                  of the last switchover trigger.
+                type: string
+              lastSwitchoverTime:
+                description: LastSwitchoverTime is when the last successful switchover
+                  completed.
+                format: date-time
+                type: string
+              localHealth:
+                description: LocalHealth holds the last observed health of the local
+                  cluster.
+                properties:
+                  healthy:
+                    description: Healthy is the aggregated health determination.
+                    type: boolean
+                  isWritable:
+                    description: IsWritable reports whether the cluster currently
+                      has read_only=OFF.
+                    type: boolean
+                  lastChecked:
+                    description: LastChecked is when this health snapshot was collected.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message contains additional diagnostic information.
+                    type: string
+                  proxySQLHealthy:
+                    description: ProxySQLHealthy is the number of local ProxySQL instances
+                      that responded.
+                    format: int32
+                    type: integer
+                  pxcReadyNodes:
+                    description: PXCReadyNodes is the number of PXC pod members currently
+                      ready.
+                    format: int32
+                    type: integer
+                  pxcState:
+                    description: PXCState is the state from the PerconaXtraDBCluster
+                      CRD (e.g. "ready", "error").
+                    type: string
+                  wsrepClusterSize:
+                    description: WsrepClusterSize is the reported Galera cluster size.
+                    format: int32
+                    type: integer
+                  wsrepClusterStatus:
+                    description: WsrepClusterStatus is the reported Galera status
+                      string (e.g. "Primary").
+                    type: string
+                required:
+                - healthy
+                - isWritable
+                type: object
+              observedGeneration:
+                description: ObservedGeneration is the last spec generation the controller
+                  processed.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current high-level operation state.
+                enum:
+                - Initializing
+                - Monitoring
+                - SwitchingOver
+                - RollingBack
+                - Degraded
+                - Error
+                type: string
+              remoteHealth:
+                description: RemoteHealth holds the last observed health of the remote
+                  cluster.
+                properties:
+                  healthy:
+                    description: Healthy is the aggregated health determination.
+                    type: boolean
+                  isWritable:
+                    description: IsWritable reports whether the cluster currently
+                      has read_only=OFF.
+                    type: boolean
+                  lastChecked:
+                    description: LastChecked is when this health snapshot was collected.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message contains additional diagnostic information.
+                    type: string
+                  proxySQLHealthy:
+                    description: ProxySQLHealthy is the number of local ProxySQL instances
+                      that responded.
+                    format: int32
+                    type: integer
+                  pxcReadyNodes:
+                    description: PXCReadyNodes is the number of PXC pod members currently
+                      ready.
+                    format: int32
+                    type: integer
+                  pxcState:
+                    description: PXCState is the state from the PerconaXtraDBCluster
+                      CRD (e.g. "ready", "error").
+                    type: string
+                  wsrepClusterSize:
+                    description: WsrepClusterSize is the reported Galera cluster size.
+                    format: int32
+                    type: integer
+                  wsrepClusterStatus:
+                    description: WsrepClusterStatus is the reported Galera status
+                      string (e.g. "Primary").
+                    type: string
+                required:
+                - healthy
+                - isWritable
+                type: object
+              switchoverProgress:
+                description: |-
+                  SwitchoverProgress is set while Phase == SwitchingOver and describes how
+                  far the engine has progressed. Used for checkpoint/resume after pod
+                  restart and for operator-facing diagnostics.
+                properties:
+                  attemptID:
+                    description: |-
+                      AttemptID is a UUID per switchover attempt. Correlates log lines,
+                      metrics, and CR events for the same attempt.
+                    type: string
+                  completedPhases:
+                    description: CompletedPhases lists phases that were fully applied,
+                      in order.
+                    items:
+                      type: string
+                    type: array
+                  currentPhase:
+                    description: CurrentPhase is the step the engine is currently
+                      executing.
+                    enum:
+                    - PreFlight
+                    - Fence
+                    - Promote
+                    - Routing
+                    - ReverseReplica
+                    - Verify
+                    - Done
+                    type: string
+                  error:
+                    description: |-
+                      Error is the first error surfaced by the failed phase, for operator
+                      visibility without grepping logs.
+                    type: string
+                  failedPhase:
+                    description: FailedPhase is set when the attempt aborted. Empty
+                      on success.
+                    type: string
+                  reason:
+                    description: Reason is the trigger that caused this attempt (manual,
+                      auto, resume).
+                    type: string
+                  startedAt:
+                    description: StartedAt is when the engine was invoked for this
+                      attempt.
+                    format: date-time
+                    type: string
+                required:
+                - attemptID
+                - currentPhase
+                - startedAt
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
