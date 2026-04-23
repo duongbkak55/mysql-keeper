@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -42,15 +41,33 @@ const (
 // single panic ends the whole run — integration tests that cannot talk to
 // MySQL have no useful answer to produce.
 func TestMain(m *testing.M) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	abs := func(p string) string {
-		a, err := filepath.Abs(p)
-		if err != nil {
-			log.Fatalf("resolve %s: %v", p, err)
-		}
-		return a
+	// Pass the GTID + replication settings as command-line arguments rather
+	// than mounting a config file. testcontainers-go's WithConfigFile places
+	// the file at /etc/mysql/conf.d/my.cnf, which the Percona image does not
+	// pick up before the server initialises GTID_MODE. Command-line flags
+	// override everything and make the container behaviour deterministic.
+	dcCmd := []string{
+		"--gtid-mode=ON",
+		"--enforce-gtid-consistency=ON",
+		"--log-bin=/var/lib/mysql/binlog",
+		"--log-replica-updates=ON",
+		"--binlog-format=ROW",
+		"--binlog-expire-logs-seconds=604800",
+		"--server-id=1",
+	}
+	drCmd := []string{
+		"--gtid-mode=ON",
+		"--enforce-gtid-consistency=ON",
+		"--log-bin=/var/lib/mysql/binlog",
+		"--log-replica-updates=ON",
+		"--binlog-format=ROW",
+		"--binlog-expire-logs-seconds=604800",
+		"--server-id=2",
+		// Do NOT set --read-only=ON at startup; the entrypoint needs write
+		// access to create the root user. We flip read_only on after setup.
 	}
 
 	dcC, err := mysql.RunContainer(ctx,
@@ -58,10 +75,10 @@ func TestMain(m *testing.M) {
 		mysql.WithDatabase("keeper"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword(rootPW),
-		mysql.WithConfigFile(abs("testdata/my-dc.cnf")),
+		withCmd(dcCmd),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("ready for connections").
-				WithStartupTimeout(90*time.Second).
+				WithStartupTimeout(120*time.Second).
 				WithOccurrence(2),
 		),
 	)
@@ -75,10 +92,10 @@ func TestMain(m *testing.M) {
 		mysql.WithDatabase("keeper"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword(rootPW),
-		mysql.WithConfigFile(abs("testdata/my-dr.cnf")),
+		withCmd(drCmd),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("ready for connections").
-				WithStartupTimeout(90*time.Second).
+				WithStartupTimeout(120*time.Second).
 				WithOccurrence(2),
 		),
 	)
@@ -107,8 +124,47 @@ func TestMain(m *testing.M) {
 		log.Fatalf("setup replication: %v", err)
 	}
 
+	// Only after the user account exists and replication is configured do we
+	// flip DR to read_only. Setting read_only via SQL (rather than the
+	// --read-only startup flag) means the entrypoint was free to create the
+	// root user at boot without hitting super_read_only guardrails.
+	if err := enforceReadOnly(ctx, drDSN); err != nil {
+		log.Fatalf("enforce read_only on DR: %v", err)
+	}
+
 	code := m.Run()
 	os.Exit(code)
+}
+
+// withCmd appends extra CMD arguments to the container request. The mysql
+// module does not expose a direct helper for this; CustomizeRequest mutates
+// the raw ContainerRequest before the container starts.
+func withCmd(args []string) testcontainers.ContainerCustomizer {
+	return testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Cmd: args,
+		},
+	})
+}
+
+// enforceReadOnly flips DR into read_only=ON + super_read_only=ON. We do this
+// in SQL, not in the startup flags, because the MySQL entrypoint needs to
+// create the root user during first boot and super_read_only blocks that.
+func enforceReadOnly(ctx context.Context, dsn string) error {
+	db, err := openWithRetries(ctx, dsn, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for _, s := range []string{
+		`SET GLOBAL super_read_only=ON`,
+		`SET GLOBAL read_only=ON`,
+	} {
+		if err := execWithRetries(ctx, db, s, 5); err != nil {
+			return fmt.Errorf("%s: %w", s, err)
+		}
+	}
+	return nil
 }
 
 // setupAsyncReplication wires DC → DR with a GTID-based async channel. It

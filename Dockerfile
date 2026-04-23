@@ -1,6 +1,10 @@
 # Build stage — runs on the host architecture (ARM or x86).
 # Go cross-compiles natively without QEMU: GOOS/GOARCH produce the correct binary.
-FROM golang:1.22-alpine AS builder
+# Track whatever toolchain go.mod declares. The base tag picks the latest
+# minor release at image build time; the actual compiler version is then
+# auto-upgraded via GOTOOLCHAIN when a dependency bumps the go directive,
+# so no Dockerfile change is needed when deps pull in a newer toolchain.
+FROM golang:1-alpine AS builder
 
 RUN apk add --no-cache git file
 
