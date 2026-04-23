@@ -36,6 +36,20 @@ type RoutingConfig struct {
 	ReadOnlyHostgroup int32
 }
 
+// BlackholeConfig describes the fence-by-routing operation used when SQL
+// fencing cannot complete. It moves the former writer into an unused hostgroup
+// and sets max_connections=0 on every ProxySQL instance, so a later recovery
+// of the local MySQL cluster cannot silently accept writes again.
+type BlackholeConfig struct {
+	// TargetHost is the MySQL node to blackhole — typically the old writer.
+	TargetHost string
+	TargetPort int32
+
+	// BlackholeHostgroup is an ID that is not routed to by any query rule.
+	// Defaults to 9999 when zero.
+	BlackholeHostgroup int32
+}
+
 // Manager manages routing across multiple ProxySQL admin interfaces.
 type Manager struct {
 	endpoints []Endpoint
@@ -86,6 +100,86 @@ func (m *Manager) RollbackRouting(ctx context.Context, cfg RoutingConfig) error 
 		ReadOnlyHostgroup:  cfg.ReadOnlyHostgroup,
 	}
 	return m.ApplyFailoverRouting(ctx, rollbackCfg)
+}
+
+// Blackhole moves the target writer entry into an unrouted hostgroup on every
+// ProxySQL instance and sets its max_connections=0. Used as an alternate fence
+// when the regular SQL fence (SET GLOBAL read_only=ON) failed. Continues past
+// per-instance failures and returns a combined error listing any hosts that
+// could not be reconfigured.
+func (m *Manager) Blackhole(ctx context.Context, cfg BlackholeConfig) error {
+	logger := log.FromContext(ctx)
+	hg := cfg.BlackholeHostgroup
+	if hg == 0 {
+		hg = 9999
+	}
+	if cfg.TargetHost == "" {
+		return fmt.Errorf("Blackhole: TargetHost must be set")
+	}
+	logger.Info("Blackholing writer via ProxySQL",
+		"host", cfg.TargetHost, "port", cfg.TargetPort, "hg", hg)
+
+	var errs []error
+	for _, ep := range m.endpoints {
+		if err := m.blackholeOne(ctx, ep, cfg.TargetHost, cfg.TargetPort, hg); err != nil {
+			logger.Error(err, "blackhole failed on ProxySQL", "host", ep.Host)
+			errs = append(errs, fmt.Errorf("proxysql %s:%d: %w", ep.Host, ep.Port, err))
+		} else {
+			logger.Info("blackhole applied", "host", ep.Host)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("blackhole errors (%d/%d failed): %v", len(errs), len(m.endpoints), errs)
+	}
+	return nil
+}
+
+func (m *Manager) blackholeOne(ctx context.Context, ep Endpoint, host string, port, hg int32) error {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/", ep.Username, ep.Password, ep.Host, ep.Port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("open admin: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetConnMaxLifetime(m.timeout)
+
+	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+
+	if err := db.PingContext(qCtx); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+
+	// Move every row matching host/port into the blackhole HG and forbid new
+	// connections. If no row exists for this node on this ProxySQL, insert one
+	// pre-emptively so a later LOAD SERVERS does not re-admit it.
+	if _, err := db.ExecContext(qCtx, `
+		UPDATE mysql_servers
+		SET hostgroup_id = ?, max_connections = 0, status = 'OFFLINE_HARD'
+		WHERE hostname = ? AND port = ?
+	`, hg, host, port); err != nil {
+		return fmt.Errorf("update mysql_servers: %w", err)
+	}
+
+	if _, err := db.ExecContext(qCtx, `
+		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
+		VALUES (?, ?, ?, 'OFFLINE_HARD', 0, 0)
+		ON DUPLICATE KEY UPDATE
+			hostgroup_id = VALUES(hostgroup_id),
+			status = 'OFFLINE_HARD',
+			max_connections = 0
+	`, hg, host, port); err != nil {
+		return fmt.Errorf("insert blackhole row: %w", err)
+	}
+
+	if _, err := db.ExecContext(qCtx, "LOAD MYSQL SERVERS TO RUNTIME"); err != nil {
+		return fmt.Errorf("LOAD MYSQL SERVERS TO RUNTIME: %w", err)
+	}
+	if _, err := db.ExecContext(qCtx, "SAVE MYSQL SERVERS TO DISK"); err != nil {
+		return fmt.Errorf("SAVE MYSQL SERVERS TO DISK: %w", err)
+	}
+	return nil
 }
 
 // applyToOne connects to one ProxySQL admin port and applies the routing change.

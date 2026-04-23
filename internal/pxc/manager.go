@@ -88,7 +88,8 @@ func (m *Manager) SetReadOnly(ctx context.Context) error {
 }
 
 // SetReadWrite promotes the cluster: verifies wsrep Primary, sets read_only=OFF,
-// verifies write, then patches isSource=true on the local CRD.
+// verifies write, stops any old inbound replication so the new source is not
+// fighting its own former upstream, then patches isSource=true on the local CRD.
 func (m *Manager) SetReadWrite(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 	logger.Info("Promoting cluster to read_only=OFF via SQL")
@@ -119,9 +120,24 @@ func (m *Manager) SetReadWrite(ctx context.Context) error {
 	}
 	logger.Info("MySQL read_only=OFF applied")
 
-	if err := m.verifyWrite(ctx, db); err != nil {
+	if err := m.VerifyWrite(ctx); err != nil {
 		_ = m.SetReadOnly(ctx) // rollback
 		return fmt.Errorf("write verification failed after promotion: %w", err)
+	}
+
+	// Stop any inbound replication for the configured channel. Without this,
+	// the new source keeps replicating from the old one — and on the next flip
+	// we would ask the old source for GTIDs the new one generated while
+	// writable, which would show up as Error 1236.
+	if m.channelName != "" {
+		if err := m.StopReplica(ctx, m.channelName); err != nil {
+			logger.Error(err, "STOP REPLICA after promote failed — investigate",
+				"channel", m.channelName)
+		}
+		if err := m.ResetReplicaAll(ctx, m.channelName); err != nil {
+			logger.Error(err, "RESET REPLICA ALL after promote failed — investigate",
+				"channel", m.channelName)
+		}
 	}
 
 	if m.k8sClient != nil {
@@ -235,11 +251,21 @@ func (m *Manager) execReadOnly(ctx context.Context, readOnly bool) error {
 	return nil
 }
 
-func (m *Manager) verifyWrite(ctx context.Context, db *sql.DB) error {
+// VerifyWrite inserts/updates the sentinel row in keeper.probe as a proof that
+// the cluster is accepting writes. Callers should call EnsureKeeperSchema once
+// during initialization so the table exists; without it this is a hard error
+// rather than a false negative about writability.
+func (m *Manager) VerifyWrite(ctx context.Context) error {
+	db, err := m.openDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
-	_, err := db.ExecContext(qCtx, `
+	_, err = db.ExecContext(qCtx, `
 		INSERT INTO keeper.probe (id, ts, node) VALUES (1, UNIX_TIMESTAMP(), @@hostname)
 		ON DUPLICATE KEY UPDATE ts=UNIX_TIMESTAMP(), node=@@hostname
 	`)

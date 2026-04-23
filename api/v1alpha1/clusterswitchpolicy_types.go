@@ -56,10 +56,23 @@ type ClusterSwitchPolicySpec struct {
 	// Switchover defines parameters for the switchover operation.
 	Switchover SwitchoverConfig `json:"switchover"`
 
+	// PreFlight carries knobs that govern the preflight checklist executed
+	// before a switchover is allowed to proceed. Defaults are production-safe.
+	// +optional
+	PreFlight PreFlightConfig `json:"preFlight,omitempty"`
+
 	// AutoFailover enables automatic promotion when the local cluster fails.
 	// When true, this controller will promote the remote cluster if local fails.
 	// +kubebuilder:default=true
 	AutoFailover bool `json:"autoFailover"`
+
+	// AllowDataLossFailover is an explicit opt-in for promoting a replica when
+	// the local cluster is destroyed and the preflight GTID subset check
+	// therefore cannot run. The operator must understand that some recent
+	// writes on the former source may be lost.
+	// +kubebuilder:default=false
+	// +optional
+	AllowDataLossFailover bool `json:"allowDataLossFailover,omitempty"`
 
 	// MANO configures the MANO (Management and Orchestration) API used to toggle
 	// isSource on both the local and remote PerconaXtraDBCluster CNFs.
@@ -219,6 +232,27 @@ type SwitchoverConfig struct {
 	// +kubebuilder:default="10s"
 	FenceTimeout metav1.Duration `json:"fenceTimeout"`
 
+	// CooldownPeriod is the minimum interval between two successive switchovers.
+	// Protects against ping-pong when a transient incident causes both sides to
+	// flap. Default 10 minutes.
+	// +kubebuilder:default="10m"
+	// +optional
+	CooldownPeriod metav1.Duration `json:"cooldownPeriod,omitempty"`
+
+	// ResumeStuckTimeout is how long a "SwitchingOver" phase may remain in the
+	// middle of a checkpoint before the controller abandons it and transitions
+	// to Degraded. Default 10 minutes.
+	// +kubebuilder:default="10m"
+	// +optional
+	ResumeStuckTimeout metav1.Duration `json:"resumeStuckTimeout,omitempty"`
+
+	// BlackholeHostgroup is the ProxySQL hostgroup used by the alternate fence
+	// path when the SQL fence fails and the local cluster is unreachable.
+	// Default 9999 (an ID no query rules route to).
+	// +kubebuilder:default=9999
+	// +optional
+	BlackholeHostgroup int32 `json:"blackholeHostgroup,omitempty"`
+
 	// ReadWriteHostgroup is the ProxySQL hostgroup ID for write traffic.
 	// +kubebuilder:default=10
 	ReadWriteHostgroup int32 `json:"readWriteHostgroup"`
@@ -265,6 +299,13 @@ type ClusterSwitchPolicyStatus struct {
 	// ConsecutiveRemoteFailures tracks consecutive health check failures for the remote cluster.
 	ConsecutiveRemoteFailures int32 `json:"consecutiveRemoteFailures,omitempty"`
 
+	// ConsecutiveLocalUnreachable counts how many successive health check cycles
+	// were unable to reach the local cluster at all (vs. reached but unhealthy).
+	// Unreachability alone must not trigger a failover; the counter is kept
+	// separately so operators can alert on this independently.
+	// +optional
+	ConsecutiveLocalUnreachable int32 `json:"consecutiveLocalUnreachable,omitempty"`
+
 	// LastSwitchoverTime is when the last successful switchover completed.
 	// +optional
 	LastSwitchoverTime *metav1.Time `json:"lastSwitchoverTime,omitempty"`
@@ -272,6 +313,18 @@ type ClusterSwitchPolicyStatus struct {
 	// LastSwitchoverReason is a human-readable description of the last switchover trigger.
 	// +optional
 	LastSwitchoverReason string `json:"lastSwitchoverReason,omitempty"`
+
+	// SwitchoverProgress is set while Phase == SwitchingOver and describes how
+	// far the engine has progressed. Used for checkpoint/resume after pod
+	// restart and for operator-facing diagnostics.
+	// +optional
+	SwitchoverProgress *SwitchoverProgress `json:"switchoverProgress,omitempty"`
+
+	// LastPreFlight holds the checklist result of the most recent switchover
+	// attempt (successful or not), so operators can see which checks passed
+	// and which blocked the flip without reading controller logs.
+	// +optional
+	LastPreFlight *PreFlightStatus `json:"lastPreFlight,omitempty"`
 
 	// Conditions provides detailed status conditions.
 	// +listType=map
@@ -281,6 +334,80 @@ type ClusterSwitchPolicyStatus struct {
 
 	// ObservedGeneration is the last spec generation the controller processed.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// SwitchoverProgress is a checkpoint written after every phase transition so
+// the reconciler can resume after a pod restart instead of leaving the CR
+// stuck in PhaseSwitchingOver forever.
+type SwitchoverProgress struct {
+	// AttemptID is a UUID per switchover attempt. Correlates log lines,
+	// metrics, and CR events for the same attempt.
+	AttemptID string `json:"attemptID"`
+
+	// StartedAt is when the engine was invoked for this attempt.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// CurrentPhase is the step the engine is currently executing.
+	// +kubebuilder:validation:Enum=PreFlight;Fence;Promote;Routing;ReverseReplica;Verify;Done
+	CurrentPhase string `json:"currentPhase"`
+
+	// CompletedPhases lists phases that were fully applied, in order.
+	// +optional
+	CompletedPhases []string `json:"completedPhases,omitempty"`
+
+	// FailedPhase is set when the attempt aborted. Empty on success.
+	// +optional
+	FailedPhase string `json:"failedPhase,omitempty"`
+
+	// Reason is the trigger that caused this attempt (manual, auto, resume).
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Error is the first error surfaced by the failed phase, for operator
+	// visibility without grepping logs.
+	// +optional
+	Error string `json:"error,omitempty"`
+}
+
+// PreFlightStatus mirrors switchover.PreFlightResult on the CR.
+type PreFlightStatus struct {
+	// PassedAt is when this preflight snapshot was collected.
+	PassedAt metav1.Time `json:"passedAt"`
+
+	// Checks captures each C-level check result.
+	// +optional
+	Checks []PreFlightCheck `json:"checks,omitempty"`
+
+	// LocalGTIDExecuted / RemoteGTIDExecuted snapshot the GTID positions that
+	// drove the subset / catch-up decisions.
+	// +optional
+	LocalGTIDExecuted string `json:"localGTIDExecuted,omitempty"`
+	// +optional
+	RemoteGTIDExecuted string `json:"remoteGTIDExecuted,omitempty"`
+}
+
+// PreFlightCheck is a single row from the preflight checklist.
+type PreFlightCheck struct {
+	Name     string `json:"name"`
+	Severity string `json:"severity"` // "hard" | "soft"
+	Passed   bool   `json:"passed"`
+	Message  string `json:"message,omitempty"`
+}
+
+// PreFlightConfig tunes the preflight checklist behavior.
+type PreFlightConfig struct {
+	// CatchupTimeout is how long the preflight may wait for the replica to
+	// apply every GTID the source has. Default 30 seconds.
+	// +kubebuilder:default="30s"
+	// +optional
+	CatchupTimeout metav1.Duration `json:"catchupTimeout,omitempty"`
+
+	// MinBinlogRetentionSeconds is the minimum binlog_expire_logs_seconds
+	// accepted on both sides. The C11 check surfaces a soft warning when this
+	// threshold is not met. Default 604800 (7 days).
+	// +kubebuilder:default=604800
+	// +optional
+	MinBinlogRetentionSeconds int64 `json:"minBinlogRetentionSeconds,omitempty"`
 }
 
 // ClusterHealthStatus holds the observed health of one cluster.

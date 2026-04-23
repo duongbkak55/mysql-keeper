@@ -1,29 +1,35 @@
 // Package mano — PXCManager is the MANO-backed implementation of the
-// switchover.PXCManager interface.
+// switchover.PXCManager / ReplicationInspector / ReplicationController
+// interfaces.
 //
 // State changes (SetReadOnly / SetReadWrite) go exclusively through the
 // MANO LCM API:
-//   POST /cnflcm/v1/custom-resources/{cnf}/{vdu}/update
-//   → poll GET /cnflcm/v1/lcm-op-occ/{id} until COMPLETED
+//
+//	POST /cnflcm/v1/custom-resources/{cnf}/{vdu}/update
+//	→ poll GET /cnflcm/v1/lcm-op-occ/{id} until COMPLETED
 //
 // MANO then triggers the PXC operator which enforces the correct read_only
-// state on the MySQL cluster. No direct SQL state-change commands are issued.
+// state on the MySQL cluster. No direct SQL state-change commands are issued
+// for isSource.
 //
-// Read state queries (IsWritable) still use a direct MySQL connection because
-// the MANO API does not expose a real-time read_only status endpoint.
+// All read-only queries (IsWritable, GTID snapshots, replication status) and
+// the side-effects that must run against the server rather than the operator
+// (STOP REPLICA, RESET REPLICA ALL) are delegated to an embedded pxc.Manager
+// using the direct MySQL connection — MANO does not expose equivalents.
 package mano
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
-// PXCManager controls a PXC cluster via the MANO LCM API and satisfies the
-// switchover.PXCManager interface without importing that package (duck typing).
+// PXCManager controls a PXC cluster via the MANO LCM API for state toggles,
+// and uses an embedded pxc.Manager for all direct-to-MySQL introspection.
 type PXCManager struct {
 	mano         *Client
 	cnfName      string
@@ -31,15 +37,15 @@ type PXCManager struct {
 	pollInterval time.Duration
 	pollTimeout  time.Duration
 
-	// mysqlDSN is used only for IsWritable and write verification queries.
-	mysqlDSN     string
-	mysqlTimeout time.Duration
+	// sql is the direct-MySQL helper used for reads and replication channel
+	// manipulation. Created from (mysqlDSN, mysqlTimeout); never talks to MANO.
+	sql *pxc.Manager
 }
 
 // NewPXCManager creates a MANO-backed PXCManager.
 //   - mano: shared MANO API client (same instance for DC and DR)
 //   - cnfName / vduName: identify this cluster's CNF in MANO
-//   - mysqlDSN: direct MySQL endpoint for read-state health queries
+//   - mysqlDSN: direct MySQL endpoint used for IsWritable / GTID / replication queries
 func NewPXCManager(
 	mano *Client,
 	cnfName, vduName string,
@@ -53,8 +59,7 @@ func NewPXCManager(
 		vduName:      vduName,
 		pollInterval: pollInterval,
 		pollTimeout:  pollTimeout,
-		mysqlDSN:     mysqlDSN,
-		mysqlTimeout: mysqlTimeout,
+		sql:          pxc.NewRemoteManager(mysqlDSN, mysqlTimeout),
 	}
 }
 
@@ -75,53 +80,60 @@ func (m *PXCManager) SetReadWrite(ctx context.Context) error {
 	return m.verifyWrite(ctx)
 }
 
-// IsWritable queries the MySQL cluster directly to check read_only=OFF.
-// This uses a direct connection because the MANO API does not expose
-// real-time MySQL variable state.
+// IsWritable delegates to the direct SQL connection; MANO does not expose
+// real-time variable state.
 func (m *PXCManager) IsWritable(ctx context.Context) (bool, error) {
-	db, err := m.openDB()
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
-
-	qCtx, cancel := context.WithTimeout(ctx, m.mysqlTimeout)
-	defer cancel()
-
-	var readOnly int
-	if err := db.QueryRowContext(qCtx, "SELECT @@read_only").Scan(&readOnly); err != nil {
-		return false, fmt.Errorf("query @@read_only: %w", err)
-	}
-	return readOnly == 0, nil
+	return m.sql.IsWritable(ctx)
 }
 
-// verifyWrite inserts/updates a sentinel row to confirm the cluster accepts writes.
+// --- ReplicationInspector ---
+
+func (m *PXCManager) GetGTIDSnapshot(ctx context.Context) (pxc.GTIDSnapshot, error) {
+	return m.sql.GetGTIDSnapshot(ctx)
+}
+
+func (m *PXCManager) GetExecutedGTID(ctx context.Context) (string, error) {
+	return m.sql.GetExecutedGTID(ctx)
+}
+
+func (m *PXCManager) IsGTIDSubset(ctx context.Context, other string) (bool, error) {
+	return m.sql.IsGTIDSubset(ctx, other)
+}
+
+func (m *PXCManager) MissingGTIDs(ctx context.Context, other string) (string, error) {
+	return m.sql.MissingGTIDs(ctx, other)
+}
+
+func (m *PXCManager) WaitForGTID(ctx context.Context, gtid string, timeout time.Duration) error {
+	return m.sql.WaitForGTID(ctx, gtid, timeout)
+}
+
+func (m *PXCManager) GetReplicationStatus(ctx context.Context, channel string) (pxc.ReplicationStatus, error) {
+	return m.sql.GetReplicationStatus(ctx, channel)
+}
+
+func (m *PXCManager) ProbeReachable(ctx context.Context, budget time.Duration) (bool, error) {
+	return m.sql.ProbeReachable(ctx, budget)
+}
+
+// --- ReplicationController ---
+
+func (m *PXCManager) StopReplica(ctx context.Context, channel string) error {
+	return m.sql.StopReplica(ctx, channel)
+}
+
+func (m *PXCManager) ResetReplicaAll(ctx context.Context, channel string) error {
+	return m.sql.ResetReplicaAll(ctx, channel)
+}
+
+// verifyWrite is still a member of this package so we can surface MANO-
+// specific error wrapping. It re-uses the embedded direct-MySQL helper.
 func (m *PXCManager) verifyWrite(ctx context.Context) error {
-	db, err := m.openDB()
-	if err != nil {
-		return err
+	if err := m.sql.EnsureKeeperSchema(ctx); err != nil {
+		return fmt.Errorf("ensure keeper schema before write verification: %w", err)
 	}
-	defer db.Close()
-
-	qCtx, cancel := context.WithTimeout(ctx, m.mysqlTimeout)
-	defer cancel()
-
-	_, err = db.ExecContext(qCtx, `
-		INSERT INTO keeper.probe (id, ts, node) VALUES (1, UNIX_TIMESTAMP(), @@hostname)
-		ON DUPLICATE KEY UPDATE ts=UNIX_TIMESTAMP(), node=@@hostname
-	`)
-	if err != nil {
-		return fmt.Errorf("write probe failed after MANO promotion: %w", err)
+	if err := m.sql.VerifyWrite(ctx); err != nil {
+		return fmt.Errorf("write probe after MANO promotion: %w", err)
 	}
 	return nil
-}
-
-func (m *PXCManager) openDB() (*sql.DB, error) {
-	db, err := sql.Open("mysql", m.mysqlDSN)
-	if err != nil {
-		return nil, fmt.Errorf("open MySQL %s: %w", m.mysqlDSN, err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetConnMaxLifetime(m.mysqlTimeout)
-	return db, nil
 }

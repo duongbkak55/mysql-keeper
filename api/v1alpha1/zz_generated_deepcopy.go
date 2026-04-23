@@ -74,12 +74,23 @@ func (in *ClusterSwitchPolicySpec) DeepCopyInto(out *ClusterSwitchPolicySpec) {
 	out.LocalMySQL = in.LocalMySQL
 	out.RemoteMySQL = in.RemoteMySQL
 	if in.ProxySQL != nil {
-		in, out := &in.ProxySQL, &out.ProxySQL
-		*out = make([]ProxySQLEndpoint, len(*in))
-		copy(*out, *in)
+		inS, outS := &in.ProxySQL, &out.ProxySQL
+		*outS = make([]ProxySQLEndpoint, len(*inS))
+		copy(*outS, *inS)
 	}
 	out.HealthCheck = in.HealthCheck
 	out.Switchover = in.Switchover
+	out.PreFlight = in.PreFlight
+	if in.MANO != nil {
+		inM, outM := &in.MANO, &out.MANO
+		*outM = new(MANOConfig)
+		(*inM).DeepCopyInto(*outM)
+	}
+	if in.RemoteKubeAPI != nil {
+		inR, outR := &in.RemoteKubeAPI, &out.RemoteKubeAPI
+		*outR = new(RemoteKubeAPIConfig)
+		(*inR).DeepCopyInto(*outR)
+	}
 }
 
 // DeepCopy creates a deep copy of ClusterSwitchPolicySpec.
@@ -98,14 +109,20 @@ func (in *ClusterSwitchPolicyStatus) DeepCopyInto(out *ClusterSwitchPolicyStatus
 	in.LocalHealth.DeepCopyInto(&out.LocalHealth)
 	in.RemoteHealth.DeepCopyInto(&out.RemoteHealth)
 	if in.LastSwitchoverTime != nil {
-		in, out := &in.LastSwitchoverTime, &out.LastSwitchoverTime
-		*out = (*in).DeepCopy()
+		in2, out2 := &in.LastSwitchoverTime, &out.LastSwitchoverTime
+		*out2 = (*in2).DeepCopy()
+	}
+	if in.SwitchoverProgress != nil {
+		out.SwitchoverProgress = in.SwitchoverProgress.DeepCopy()
+	}
+	if in.LastPreFlight != nil {
+		out.LastPreFlight = in.LastPreFlight.DeepCopy()
 	}
 	if in.Conditions != nil {
-		in, out := &in.Conditions, &out.Conditions
-		*out = make([]metav1.Condition, len(*in))
-		for i := range *in {
-			(*in)[i].DeepCopyInto(&(*out)[i])
+		inC, outC := &in.Conditions, &out.Conditions
+		*outC = make([]metav1.Condition, len(*inC))
+		for i := range *inC {
+			(*inC)[i].DeepCopyInto(&(*outC)[i])
 		}
 	}
 }
@@ -124,8 +141,8 @@ func (in *ClusterSwitchPolicyStatus) DeepCopy() *ClusterSwitchPolicyStatus {
 func (in *ClusterHealthStatus) DeepCopyInto(out *ClusterHealthStatus) {
 	*out = *in
 	if in.LastChecked != nil {
-		in, out := &in.LastChecked, &out.LastChecked
-		*out = (*in).DeepCopy()
+		in2, out2 := &in.LastChecked, &out.LastChecked
+		*out2 = (*in2).DeepCopy()
 	}
 }
 
@@ -210,6 +227,103 @@ func (in *SwitchoverConfig) DeepCopy() *SwitchoverConfig {
 		return nil
 	}
 	out := new(SwitchoverConfig)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies PreFlightConfig.
+func (in *PreFlightConfig) DeepCopyInto(out *PreFlightConfig) {
+	*out = *in
+}
+
+// DeepCopy creates a deep copy of PreFlightConfig.
+func (in *PreFlightConfig) DeepCopy() *PreFlightConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(PreFlightConfig)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies MANOConfig.
+func (in *MANOConfig) DeepCopyInto(out *MANOConfig) {
+	*out = *in
+	if in.TokenSecretRef != nil {
+		out.TokenSecretRef = in.TokenSecretRef.DeepCopy()
+	}
+	if in.CredentialsSecretRef != nil {
+		out.CredentialsSecretRef = in.CredentialsSecretRef.DeepCopy()
+	}
+}
+
+// DeepCopy creates a deep copy of MANOConfig.
+func (in *MANOConfig) DeepCopy() *MANOConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(MANOConfig)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies RemoteKubeAPIConfig.
+func (in *RemoteKubeAPIConfig) DeepCopyInto(out *RemoteKubeAPIConfig) {
+	*out = *in
+	if in.CASecretRef != nil {
+		out.CASecretRef = in.CASecretRef.DeepCopy()
+	}
+	out.TokenSecretRef = in.TokenSecretRef
+}
+
+// DeepCopy creates a deep copy of RemoteKubeAPIConfig.
+func (in *RemoteKubeAPIConfig) DeepCopy() *RemoteKubeAPIConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(RemoteKubeAPIConfig)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies SwitchoverProgress.
+func (in *SwitchoverProgress) DeepCopyInto(out *SwitchoverProgress) {
+	*out = *in
+	out.StartedAt = *in.StartedAt.DeepCopy()
+	if in.CompletedPhases != nil {
+		inP, outP := &in.CompletedPhases, &out.CompletedPhases
+		*outP = make([]string, len(*inP))
+		copy(*outP, *inP)
+	}
+}
+
+// DeepCopy creates a deep copy of SwitchoverProgress.
+func (in *SwitchoverProgress) DeepCopy() *SwitchoverProgress {
+	if in == nil {
+		return nil
+	}
+	out := new(SwitchoverProgress)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto copies PreFlightStatus.
+func (in *PreFlightStatus) DeepCopyInto(out *PreFlightStatus) {
+	*out = *in
+	out.PassedAt = *in.PassedAt.DeepCopy()
+	if in.Checks != nil {
+		inC, outC := &in.Checks, &out.Checks
+		*outC = make([]PreFlightCheck, len(*inC))
+		copy(*outC, *inC)
+	}
+}
+
+// DeepCopy creates a deep copy of PreFlightStatus.
+func (in *PreFlightStatus) DeepCopy() *PreFlightStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(PreFlightStatus)
 	in.DeepCopyInto(out)
 	return out
 }
