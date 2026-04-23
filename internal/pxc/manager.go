@@ -197,8 +197,19 @@ func (m *Manager) EnsureKeeperSchema(ctx context.Context) error {
 	return nil
 }
 
-// patchIsSource sets spec.replication.channels[channelName].isSource on the PXC CRD.
+// patchIsSource sets spec.replication.channels[channelName].isSource on the
+// PXC CRD and verifies the change sticks. The PXC operator has historically
+// reconciled replication settings back to a cached value in certain corner
+// cases; a Get-after-Patch loop catches that before we move on to the next
+// phase.
 func (m *Manager) patchIsSource(ctx context.Context, isSource bool) error {
+	const (
+		verifyAttempts = 5
+		verifyInterval = 2 * time.Second
+	)
+
+	logger := log.FromContext(ctx)
+
 	pxcObj := &PerconaXtraDBCluster{}
 	if err := m.k8sClient.Get(ctx, types.NamespacedName{
 		Namespace: m.pxcNamespace,
@@ -225,7 +236,50 @@ func (m *Manager) patchIsSource(ctx context.Context, isSource bool) error {
 		return fmt.Errorf("replication channel %q not found in PerconaXtraDBCluster %s/%s", m.channelName, m.pxcNamespace, m.pxcName)
 	}
 
-	return m.k8sClient.Patch(ctx, pxcObj, patch)
+	if err := m.k8sClient.Patch(ctx, pxcObj, patch); err != nil {
+		return fmt.Errorf("patch PerconaXtraDBCluster: %w", err)
+	}
+
+	// Verify the value is observed on a fresh Get, up to verifyAttempts times.
+	var lastObserved bool
+	for attempt := 0; attempt < verifyAttempts; attempt++ {
+		select {
+		case <-time.After(verifyInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		verify := &PerconaXtraDBCluster{}
+		if err := m.k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: m.pxcNamespace,
+			Name:      m.pxcName,
+		}, verify); err != nil {
+			// transient — retry
+			logger.Error(err, "CRD verify get failed, retrying",
+				"attempt", attempt+1, "max", verifyAttempts)
+			continue
+		}
+
+		if verify.Spec.Replication == nil {
+			return fmt.Errorf("spec.replication disappeared during verify")
+		}
+		for _, ch := range verify.Spec.Replication.Channels {
+			if ch.Name != m.channelName {
+				continue
+			}
+			lastObserved = ch.IsSource
+			if ch.IsSource == isSource {
+				logger.Info("CRD isSource change verified",
+					"channel", m.channelName, "isSource", isSource, "attempt", attempt+1)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf(
+		"CRD isSource did not stick after %d verifications: wanted=%t observed=%t (operator may be reverting)",
+		verifyAttempts, isSource, lastObserved,
+	)
 }
 
 func (m *Manager) execReadOnly(ctx context.Context, readOnly bool) error {

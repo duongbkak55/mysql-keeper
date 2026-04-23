@@ -112,6 +112,27 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Deletion path: let the finalizer logic decide whether it is safe to
+	// release the CR, then stop.
+	if !policy.DeletionTimestamp.IsZero() {
+		if res, err := r.handleDeletion(ctx, policy); err != nil {
+			return ctrl.Result{}, err
+		} else if res != nil {
+			return *res, nil
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// First-time: attach the finalizer so deletes block on us instead of
+	// racing against a mid-switchover.
+	if added, err := r.ensureFinalizer(ctx, policy); err != nil {
+		return ctrl.Result{}, err
+	} else if added {
+		// We just mutated the object — return so the next reconcile sees the
+		// finalizer in place before we change anything else.
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Initialize Phase so we never observe an empty string.
 	if policy.Status.Phase == "" {
 		patch := client.MergeFrom(policy.DeepCopy())
@@ -148,13 +169,20 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	// moving in the presence of transient connectivity issues.
 	r.ensureKeeperSchema(ctx, policy, comps, localHealth, remoteHealth)
 
+	// Heartbeat the leader lease on the active cluster. The lease is used by
+	// the peer controller to decide whether it can promote; a fresh lease
+	// means "don't flip, the source is alive". Failure here is logged but
+	// non-fatal — we do not want a transient DB blip to cause a split-brain
+	// decision on the other side.
+	r.heartbeatLeaderLease(ctx, policy, comps, localHealth)
+
 	// If a switchover checkpoint exists, decide resume vs abandon before we
 	// consider starting a new one.
 	if resumeResult := r.handleStuckSwitchover(ctx, policy); resumeResult != nil {
 		return *resumeResult, nil
 	}
 
-	reason, shouldSwitch := r.decideSwitchover(ctx, policy, localHealth, remoteHealth)
+	reason, shouldSwitch := r.decideSwitchover(ctx, policy, comps, localHealth, remoteHealth)
 	if !shouldSwitch {
 		if policy.Status.Phase != mysqlv1alpha1.PhaseSwitchingOver {
 			patch := client.MergeFrom(policy.DeepCopy())
@@ -169,6 +197,19 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	attemptID := uuid.NewString()
 	logger = logger.WithValues("attemptID", attemptID, "reason", reason)
 	logger.Info("Starting switchover attempt")
+
+	// Clear the manual trigger BEFORE we run the switchover. If we left it set
+	// and the attempt failed, the next reconcile would see the trigger again
+	// and re-enter Execute — exactly the ping-pong we want to avoid. The
+	// manual trigger should represent "one attempt" regardless of outcome.
+	if policy.Spec.ManualSwitchoverTarget != "" {
+		specPatch := client.MergeFrom(policy.DeepCopy())
+		policy.Spec.ManualSwitchoverTarget = ""
+		if err := r.Patch(ctx, policy, specPatch); err != nil {
+			logger.Error(err, "Failed to clear manualSwitchoverTarget before execute — aborting")
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Mark Phase=SwitchingOver up front so concurrent reconciles do not
 	// retrigger. The progressReporter will take over writing SwitchoverProgress
@@ -253,6 +294,7 @@ func (r *ClusterSwitchPolicyReconciler) handleStuckSwitchover(
 func (r *ClusterSwitchPolicyReconciler) decideSwitchover(
 	ctx context.Context,
 	policy *mysqlv1alpha1.ClusterSwitchPolicy,
+	comps *componentSet,
 	localHealth, remoteHealth health.ClusterHealth,
 ) (reason string, should bool) {
 	logger := log.FromContext(ctx)
@@ -310,6 +352,23 @@ func (r *ClusterSwitchPolicyReconciler) decideSwitchover(
 		logger.Info("Local unhealthy but remote is also unhealthy — skipping",
 			"remoteMsg", remoteHealth.Message)
 		return "", false
+	}
+
+	// Peer-lease gate: the cluster we are about to promote has a lease row
+	// pointing at a live peer controller. If that lease is fresh and owned by
+	// someone other than us, the peer is already running; stepping in would
+	// race with their promotion decision. Only take over a stale lease.
+	if comps.remoteSchemaInit != nil {
+		ownerID := controllerOwnerID(policy)
+		ttl := leaseTTL(policy)
+		if err := switchover.CheckPeerLease(ctx, comps.remoteSchemaInit, time.Now(), ttl, ownerID); err != nil {
+			logger.Info("Peer-lease gate denied switchover",
+				"reason", err.Error())
+			metrics.ManualInterventionRequired.WithLabelValues(
+				policy.Spec.ClusterRole, "peer_lease",
+			).Inc()
+			return "", false
+		}
 	}
 
 	return fmt.Sprintf("automatic failover: local unhealthy for %d consecutive checks",
@@ -443,18 +502,6 @@ func (r *ClusterSwitchPolicyReconciler) writeSwitchoverResult(
 	if err := r.Status().Patch(ctx, policy, resultPatch); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// Clear ManualSwitchoverTarget only after we have recorded the outcome.
-	// Doing it earlier would make a failed attempt disappear silently; doing
-	// it later in a separate patch lets the spec roundtrip independently.
-	if policy.Spec.ManualSwitchoverTarget != "" && result.Success {
-		specPatch := client.MergeFrom(policy.DeepCopy())
-		policy.Spec.ManualSwitchoverTarget = ""
-		if err := r.Patch(ctx, policy, specPatch); err != nil {
-			logger.Error(err, "Failed to clear manualSwitchoverTarget (will retry next reconcile)")
-		}
-	}
-
 	return ctrl.Result{RequeueAfter: policy.Spec.HealthCheck.Interval.Duration}, nil
 }
 
@@ -474,13 +521,68 @@ func (r *ClusterSwitchPolicyReconciler) ensureKeeperSchema(
 		if err := comps.localSchemaInit.EnsureKeeperSchema(ctx); err != nil {
 			logger.Error(err, "EnsureKeeperSchema on local writable cluster failed")
 		}
+		if err := comps.localSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
+			logger.Error(err, "EnsureLeaderLeaseSchema on local writable cluster failed")
+		}
 	}
 	if remoteHealth.Writable == health.WritableYes && comps.remoteSchemaInit != nil {
 		if err := comps.remoteSchemaInit.EnsureKeeperSchema(ctx); err != nil {
 			logger.Error(err, "EnsureKeeperSchema on remote writable cluster failed")
 		}
+		if err := comps.remoteSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
+			logger.Error(err, "EnsureLeaderLeaseSchema on remote writable cluster failed")
+		}
 	}
 	_ = policy // reserved for future use (config-driven enable/disable)
+}
+
+// heartbeatLeaderLease renews keeper.leader on the active (writable) cluster
+// so the peer controller can see that we are alive. When the local cluster is
+// the active one we talk to it directly; otherwise we skip (the peer is the
+// one keeping its own lease fresh).
+func (r *ClusterSwitchPolicyReconciler) heartbeatLeaderLease(
+	ctx context.Context,
+	policy *mysqlv1alpha1.ClusterSwitchPolicy,
+	comps *componentSet,
+	localHealth health.ClusterHealth,
+) {
+	if comps.localSchemaInit == nil {
+		return
+	}
+	if localHealth.Writable != health.WritableYes {
+		return
+	}
+	logger := log.FromContext(ctx)
+
+	ownerID := controllerOwnerID(policy)
+	ttl := leaseTTL(policy)
+	if _, err := comps.localSchemaInit.AcquireOrRenewLease(ctx, ownerID, ttl); err != nil {
+		logger.Error(err, "lease heartbeat failed (non-fatal)",
+			"owner", ownerID, "ttl", ttl.String())
+	}
+}
+
+// controllerOwnerID is the identity this controller writes into keeper.leader
+// so the peer can tell us apart from itself. The role+namespace+name tuple is
+// unique per CR and survives pod restarts.
+func controllerOwnerID(policy *mysqlv1alpha1.ClusterSwitchPolicy) string {
+	return fmt.Sprintf("%s:%s/%s",
+		policy.Spec.ClusterRole, policy.Namespace, policy.Name)
+}
+
+// leaseTTL derives the lease-expiry window from the configured health check
+// interval. We want at least 3 missed heartbeats to declare the peer stale
+// so a single blip does not cause a mistaken takeover.
+func leaseTTL(policy *mysqlv1alpha1.ClusterSwitchPolicy) time.Duration {
+	interval := policy.Spec.HealthCheck.Interval.Duration
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ttl := interval * 3
+	if ttl < 30*time.Second {
+		ttl = 30 * time.Second
+	}
+	return ttl
 }
 
 // updateHealthStatus persists the freshly-observed health snapshots and the

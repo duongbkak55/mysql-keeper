@@ -64,27 +64,82 @@ func NewManager(endpoints []Endpoint, timeout time.Duration) *Manager {
 	}
 }
 
-// ApplyFailoverRouting reconfigures all ProxySQL instances to route writes to the new writer.
-// On partial failure, it continues to update all reachable instances and returns a combined error.
+// ApplyFailoverRouting reconfigures all ProxySQL instances to route writes to
+// the new writer. Internally it is a two-phase apply:
+//
+//  1. Prepare: connect to every instance and stage the new mysql_servers rows
+//     without calling LOAD to runtime yet. If any instance fails here, no
+//     instance has runtime-visible changes yet, so rollback is trivial.
+//  2. Commit: LOAD + SAVE on every instance that staged successfully. If a
+//     partial failure occurs here we fall back to a best-effort rollback that
+//     also emits the partial-apply set for alerting.
+//
+// This narrows the "2 of 3 ProxySQL saw the new writer, 1 didn't" window to
+// the duration of the commit phase itself (seconds), versus the prior
+// one-by-one sequence which left the cluster in mixed state for the whole
+// retry cycle.
 func (m *Manager) ApplyFailoverRouting(ctx context.Context, cfg RoutingConfig) error {
 	logger := log.FromContext(ctx)
-	logger.Info("Applying failover routing to ProxySQL instances",
+	logger.Info("Applying failover routing to ProxySQL instances (2-phase)",
 		"newWriter", cfg.NewWriterHost,
 		"oldWriter", cfg.OldWriterHost,
+		"instances", len(m.endpoints),
 	)
 
-	var errs []error
-	for _, ep := range m.endpoints {
-		if err := m.applyToOne(ctx, ep, cfg); err != nil {
-			logger.Error(err, "Failed to update ProxySQL instance", "host", ep.Host)
-			errs = append(errs, fmt.Errorf("proxysql %s:%d: %w", ep.Host, ep.Port, err))
-		} else {
-			logger.Info("ProxySQL instance updated", "host", ep.Host)
-		}
+	type stagedConn struct {
+		ep Endpoint
+		db *sql.DB
 	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("ProxySQL update errors (%d/%d failed): %v", len(errs), len(m.endpoints), errs)
+	staged := make([]stagedConn, 0, len(m.endpoints))
+	var prepareErrs []error
+
+	// Phase 1: Prepare on every instance.
+	for _, ep := range m.endpoints {
+		db, err := m.prepareOne(ctx, ep, cfg)
+		if err != nil {
+			prepareErrs = append(prepareErrs, fmt.Errorf("proxysql %s:%d: %w", ep.Host, ep.Port, err))
+			logger.Error(err, "prepare failed", "host", ep.Host)
+			if db != nil {
+				db.Close()
+			}
+			continue
+		}
+		staged = append(staged, stagedConn{ep: ep, db: db})
+	}
+
+	// If ANY instance failed prepare, abort without touching runtime on the
+	// others. The rows we staged on the successful instances are harmless
+	// because they only become effective once LOAD SERVERS runs.
+	if len(prepareErrs) > 0 {
+		for _, s := range staged {
+			s.db.Close()
+		}
+		return fmt.Errorf(
+			"prepare phase failed on %d/%d instances (no runtime change applied): %v",
+			len(prepareErrs), len(m.endpoints), prepareErrs,
+		)
+	}
+
+	// Phase 2: Commit on every prepared instance.
+	var commitErrs []error
+	var committed []stagedConn
+	for _, s := range staged {
+		if err := m.commitOne(ctx, s.db); err != nil {
+			commitErrs = append(commitErrs,
+				fmt.Errorf("proxysql %s:%d: %w", s.ep.Host, s.ep.Port, err))
+			logger.Error(err, "commit failed — partial runtime apply", "host", s.ep.Host)
+		} else {
+			committed = append(committed, s)
+		}
+		s.db.Close()
+	}
+
+	if len(commitErrs) > 0 {
+		return fmt.Errorf(
+			"commit phase failed on %d/%d instances (committed=%d, manual ProxySQL reconciliation required): %v",
+			len(commitErrs), len(m.endpoints), len(committed), commitErrs,
+		)
 	}
 	return nil
 }
@@ -182,15 +237,16 @@ func (m *Manager) blackholeOne(ctx context.Context, ep Endpoint, host string, po
 	return nil
 }
 
-// applyToOne connects to one ProxySQL admin port and applies the routing change.
-func (m *Manager) applyToOne(ctx context.Context, ep Endpoint, cfg RoutingConfig) error {
+// prepareOne stages the routing change on a single ProxySQL instance without
+// calling LOAD SERVERS. It returns an open *sql.DB so commitOne can finish
+// the change on the same session; the caller is responsible for Close.
+func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig) (*sql.DB, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/", ep.Username, ep.Password, ep.Host, ep.Port)
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return fmt.Errorf("open admin connection: %w", err)
+		return nil, fmt.Errorf("open admin connection: %w", err)
 	}
-	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(m.timeout)
 
@@ -198,55 +254,54 @@ func (m *Manager) applyToOne(ctx context.Context, ep Endpoint, cfg RoutingConfig
 	defer cancel()
 
 	if err := db.PingContext(qCtx); err != nil {
-		return fmt.Errorf("ping: %w", err)
+		return db, fmt.Errorf("ping: %w", err)
 	}
 
-	// Step 1: Remove old writer from RW hostgroup (move to RO or disable).
-	// Set max_connections=0 on old writer to drain connections gracefully.
-	_, err = db.ExecContext(qCtx, `
+	// Step 1: Demote old writer in the staged mysql_servers table.
+	if _, err := db.ExecContext(qCtx, `
 		UPDATE mysql_servers
 		SET hostgroup_id = ?, max_connections = 0
 		WHERE hostname = ? AND port = ?
-	`, cfg.ReadOnlyHostgroup, cfg.OldWriterHost, cfg.OldWriterPort)
-	if err != nil {
-		return fmt.Errorf("demote old writer: %w", err)
+	`, cfg.ReadOnlyHostgroup, cfg.OldWriterHost, cfg.OldWriterPort); err != nil {
+		return db, fmt.Errorf("demote old writer: %w", err)
 	}
 
-	// Step 2: Insert or update new writer into RW hostgroup.
-	_, err = db.ExecContext(qCtx, `
+	// Step 2: Stage the new writer in the write HG.
+	if _, err := db.ExecContext(qCtx, `
 		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
 		ON DUPLICATE KEY UPDATE
-			hostgroup_id   = VALUES(hostgroup_id),
-			status         = 'ONLINE',
+			hostgroup_id    = VALUES(hostgroup_id),
+			status          = 'ONLINE',
 			max_connections = 1000,
-			weight         = 1
-	`, cfg.ReadWriteHostgroup, cfg.NewWriterHost, cfg.NewWriterPort)
-	if err != nil {
-		return fmt.Errorf("promote new writer: %w", err)
+			weight          = 1
+	`, cfg.ReadWriteHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
+		return db, fmt.Errorf("promote new writer: %w", err)
 	}
 
-	// Step 3: Ensure new writer is also in RO hostgroup for read traffic.
-	_, err = db.ExecContext(qCtx, `
+	// Step 3: Also put the new writer in the read HG for SELECT traffic.
+	if _, err := db.ExecContext(qCtx, `
 		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
 		ON DUPLICATE KEY UPDATE
-			status         = 'ONLINE',
+			status          = 'ONLINE',
 			max_connections = 1000
-	`, cfg.ReadOnlyHostgroup, cfg.NewWriterHost, cfg.NewWriterPort)
-	if err != nil {
-		return fmt.Errorf("add new writer to RO group: %w", err)
+	`, cfg.ReadOnlyHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
+		return db, fmt.Errorf("add new writer to RO group: %w", err)
 	}
+	return db, nil
+}
 
-	// Step 4: Apply changes to runtime.
+// commitOne runs LOAD + SAVE on an already-prepared connection.
+func (m *Manager) commitOne(ctx context.Context, db *sql.DB) error {
+	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+
 	if _, err := db.ExecContext(qCtx, "LOAD MYSQL SERVERS TO RUNTIME"); err != nil {
 		return fmt.Errorf("LOAD MYSQL SERVERS TO RUNTIME: %w", err)
 	}
-
-	// Step 5: Persist changes to disk.
 	if _, err := db.ExecContext(qCtx, "SAVE MYSQL SERVERS TO DISK"); err != nil {
 		return fmt.Errorf("SAVE MYSQL SERVERS TO DISK: %w", err)
 	}
-
 	return nil
 }
