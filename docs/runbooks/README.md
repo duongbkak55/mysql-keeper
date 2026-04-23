@@ -5,6 +5,7 @@
 | Switchover stuck in `SwitchingOver`                | [switchover-stuck.md](switchover-stuck.md)      | warning/critical |
 | Both clusters writable at the same time            | [split-brain-recovery.md](split-brain-recovery.md) | critical (page)  |
 | Planned DR drill (quarterly / post-upgrade)        | [dr-drill.md](dr-drill.md)                      | informational    |
+| Chaos drills (D1–D5) on staging                    | [chaos-drills.md](chaos-drills.md)              | informational    |
 
 ## When to disable `autoFailover`
 
