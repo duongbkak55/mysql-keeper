@@ -62,6 +62,9 @@ spec:
     timeout: 5m
     drainTimeout: 30s
     fenceTimeout: 10s
+    cooldownPeriod: 10m
+    resumeStuckTimeout: 10m
+    blackholeHostgroup: 9999
     readWriteHostgroup: 10
     readOnlyHostgroup: 20
     # After failover (DR becomes primary), writes stay on local DR PXC.
@@ -69,6 +72,12 @@ spec:
     remoteWriterPort: 3306
     # The DC writer entry in ProxySQL (originally pointing to DC) to demote.
     localWriterHost: 10.10.0.100   # DC MySQL external endpoint (same as remoteMySQL.host).
+
+  preFlight:
+    catchupTimeout: 30s
+    minBinlogRetentionSeconds: 604800
+
+  allowDataLossFailover: false
 
   # MANO API config — same MANO instance as the DC side.
   # localCnfName/localVduName = DR cluster CNF; remoteCnfName/remoteVduName = DC cluster CNF.

@@ -65,6 +65,9 @@ spec:
     timeout: 5m                # Abort and roll back if switchover exceeds 5 minutes.
     drainTimeout: 30s          # Wait 30s for connections to drain before fencing.
     fenceTimeout: 10s          # Max time to attempt fencing (set read_only=ON) on local cluster.
+    cooldownPeriod: 10m        # Minimum interval between consecutive switchovers.
+    resumeStuckTimeout: 10m    # Abandon a switchover whose progress has not advanced in this long.
+    blackholeHostgroup: 9999   # ProxySQL HG used by the alternate fence path (unrouted).
     readWriteHostgroup: 10     # ProxySQL HG 10 = write traffic.
     readOnlyHostgroup: 20      # ProxySQL HG 20 = read traffic.
     # After failover, writes route to the DR cluster via its external MySQL IP.
@@ -72,6 +75,18 @@ spec:
     remoteWriterPort: 3306
     # The local DC writer entry to demote in ProxySQL.
     localWriterHost: pxc-dc-haproxy.percona-xtradb.svc.cluster.local
+
+  # PreFlight gates the switchover on GTID completeness and replication health.
+  # These defaults are production-safe; override only after reading
+  # docs/runbooks/dr-drill.md.
+  preFlight:
+    catchupTimeout: 30s                  # How long to wait for the replica to catch up.
+    minBinlogRetentionSeconds: 604800    # 7 days — C11 soft check.
+
+  # AllowDataLossFailover lets the controller promote DR even when the
+  # preflight GTID subset check cannot run (DC is destroyed). Leave false
+  # unless the business has explicitly accepted the data-loss risk.
+  allowDataLossFailover: false
 
   # MANO API config (recommended). When set, isSource changes on both local and remote
   # PXC clusters are applied via the MANO LCM API, which then reconciles the CRD.
