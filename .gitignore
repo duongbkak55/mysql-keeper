@@ -1,1 +1,5 @@
 /.DS_Store
+# Binaries built by scripts/local/pxc-preflight.sh
+bin/
+preflight-cli
+preflight-cli.exe
