@@ -122,3 +122,17 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub repository description
+        # Sync docs/dockerhub-overview.md to the repo's README on Docker Hub
+        # so visitors see the full usage + sample-CR pointers without having
+        # to click through to GitHub. Only runs on main so feature-branch
+        # experiments do not overwrite the published description.
+        if: github.ref == 'refs/heads/main'
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ steps.image.outputs.name }}
+          short-description: "K8s controller for automatic DC-DR Percona XtraDB Cluster switchover"
+          readme-filepath: docs/dockerhub-overview.md
