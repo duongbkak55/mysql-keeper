@@ -28,13 +28,11 @@ func TestInteg_LeaderLease_Concurrent(t *testing.T) {
 		t.Fatalf("EnsureLeaderLeaseSchema: %v", err)
 	}
 
-	// Clean slate — otherwise a prior test leaves a row that makes the first
-	// acquirer a "renew same owner" case instead of the first-INSERT path.
-	// We do this by calling the manager and then resetting.
-	if _, err := mgr.GetLeaderLease(ctx); err == nil {
-		// row exists — delete it via a raw connection so tests are independent
-		dropLeaseRow(ctx, t)
-	}
+	// Reset the singleton row to the "empty owner" sentinel so both test
+	// goroutines see the same starting state. We do not DELETE because
+	// EnsureLeaderLeaseSchema's seed is now part of the invariant — a plain
+	// UPDATE keeps the row's existence and just blanks the owner.
+	resetLeaseRow(ctx, t)
 
 	const controllerA = "dc-controller-A"
 	const controllerB = "dr-controller-B"
@@ -96,26 +94,24 @@ type leaseOutcome struct {
 	err   error
 }
 
-// dropLeaseRow clears keeper.leader so each test starts from a known state.
-func dropLeaseRow(ctx context.Context, t *testing.T) {
+// resetLeaseRow restores keeper.leader to the post-seed state so each test
+// starts from a known baseline. Production code never needs this helper —
+// it exists purely so tests can be order-independent.
+func resetLeaseRow(ctx context.Context, t *testing.T) {
 	t.Helper()
-	// Reuse the shared rootDSN through a temporary Manager only for its
-	// openDB path. We do the DELETE directly rather than expose a public
-	// reset helper because the production code never needs one.
-	mgr := pxc.NewRemoteManager(dcDSN, 5*time.Second)
-	_, _ = mgr.GetLeaderLease(ctx) // warm up the connection pool
-	// The Manager does not expose a delete — do a surgical reset by
-	// re-creating the schema (which is a no-op) and then issuing a raw
-	// DELETE via a short-lived *sql.DB.
-	exec := func(stmt string) {
-		db, err := openRootDB(dcDSN)
-		if err != nil {
-			t.Fatalf("openRootDB: %v", err)
-		}
-		defer db.Close()
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("%s: %v", stmt, err)
-		}
+	db, err := openRootDB(dcDSN)
+	if err != nil {
+		t.Fatalf("openRootDB: %v", err)
 	}
-	exec(`DELETE FROM keeper.leader`)
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `
+		UPDATE keeper.leader
+		SET owner = '', epoch = 0,
+		    acquired_at = NOW(6),
+		    heartbeat_at = '1970-01-01 00:00:01',
+		    renewed_by = ''
+		WHERE id = 1
+	`); err != nil {
+		t.Fatalf("reset keeper.leader: %v", err)
+	}
 }

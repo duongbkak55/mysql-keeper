@@ -198,12 +198,35 @@ func TestInteg_BinlogRetentionShort(t *testing.T) {
 
 // waitForReplica blocks until DR has applied the given GTID set, using the
 // same WAIT_FOR_EXECUTED_GTID_SET primitive that the real preflight uses.
+// Before waiting on the GTID, this helper also confirms the IO + SQL threads
+// are running, because a preceding test may have stopped them and the
+// cleanup only restarted them asynchronously.
 func waitForReplica(ctx context.Context, t *testing.T, gtid string) {
 	t.Helper()
+	waitReplicationRunning(ctx, t, 10*time.Second)
 	rm := pxc.NewRemoteManager(drDSN, 5*time.Second)
-	if err := rm.WaitForGTID(ctx, gtid, 15*time.Second); err != nil {
+	if err := rm.WaitForGTID(ctx, gtid, 30*time.Second); err != nil {
 		t.Fatalf("waitForReplica: %v", err)
 	}
+}
+
+// waitReplicationRunning polls performance_schema until both the receiver
+// (IO) and applier (SQL) threads for the test channel are in service_state
+// "ON" with no last error. Used at the top of tests that need a clean
+// baseline after a prior test stopped / restarted the threads.
+func waitReplicationRunning(ctx context.Context, t *testing.T, budget time.Duration) {
+	t.Helper()
+	rm := pxc.NewRemoteManager(drDSN, 5*time.Second)
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		status, err := rm.GetReplicationStatus(ctx, channelName)
+		if err == nil && status.Running() {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	status, _ := rm.GetReplicationStatus(ctx, channelName)
+	t.Fatalf("replication not running within %s: %s", budget, status.HumanMessage())
 }
 
 // buildPreflight wires the standard set of managers used across every test

@@ -68,6 +68,18 @@ func (m *Manager) EnsureLeaderLeaseSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create keeper.leader: %w", err)
 	}
+	// Pre-seed the singleton row with an empty owner. This turns the race
+	// condition "two controllers both discover no row and both try to INSERT"
+	// (which deadlocks under SELECT ... FOR UPDATE) into the ordinary
+	// "takeover of a stale row" path, which is already serialised by the
+	// row lock.
+	if _, err := db.ExecContext(qCtx, `
+		INSERT IGNORE INTO keeper.leader
+			(id, owner, epoch, acquired_at, heartbeat_at, renewed_by)
+		VALUES (1, '', 0, NOW(6), '1970-01-01 00:00:01', '')
+	`); err != nil {
+		return fmt.Errorf("seed keeper.leader: %w", err)
+	}
 	return nil
 }
 
@@ -140,25 +152,30 @@ func (m *Manager) runAcquireOrRenew(
 		FROM keeper.leader WHERE id = 1 FOR UPDATE`,
 	).Scan(&current.Owner, &current.Epoch, &current.AcquiredAt, &current.HeartbeatAt, &current.RenewedBy)
 
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	if errors.Is(err, sql.ErrNoRows) {
+		// Should not happen — EnsureLeaderLeaseSchema pre-seeds the row. But
+		// be defensive for clusters that were bootstrapped before this code
+		// existed: fall back to INSERT IGNORE, then re-read.
 		if _, err := tx.ExecContext(qCtx, `
-			INSERT INTO keeper.leader (id, owner, epoch, acquired_at, heartbeat_at, renewed_by)
-			VALUES (1, ?, 1, NOW(6), NOW(6), ?)`,
-			ownerID, ownerID); err != nil {
-			return LeaderLease{}, fmt.Errorf("insert initial lease: %w", err)
+			INSERT IGNORE INTO keeper.leader
+				(id, owner, epoch, acquired_at, heartbeat_at, renewed_by)
+			VALUES (1, '', 0, NOW(6), '1970-01-01 00:00:01', '')`); err != nil {
+			return LeaderLease{}, fmt.Errorf("lazy seed keeper.leader: %w", err)
 		}
-		if err := tx.Commit(); err != nil {
-			return LeaderLease{}, fmt.Errorf("commit initial lease: %w", err)
-		}
-		return m.getLeaseOnDB(ctx, db)
-
-	case err != nil:
+		err = tx.QueryRowContext(qCtx, `
+			SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by
+			FROM keeper.leader WHERE id = 1 FOR UPDATE`,
+		).Scan(&current.Owner, &current.Epoch, &current.AcquiredAt, &current.HeartbeatAt, &current.RenewedBy)
+	}
+	if err != nil {
 		return LeaderLease{}, fmt.Errorf("select keeper.leader: %w", err)
 	}
 
 	now := time.Now().UTC()
-	stale := current.Expired(now, ttl)
+	// The seed row carries owner='' and heartbeat_at = epoch; treat that as
+	// "nobody is the leader". Same code path as stale-takeover, so we bump
+	// epoch from 0 to 1 on first real acquisition.
+	available := current.Owner == "" || current.Expired(now, ttl)
 
 	switch {
 	case current.Owner == ownerID:
@@ -169,7 +186,7 @@ func (m *Manager) runAcquireOrRenew(
 			return LeaderLease{}, fmt.Errorf("renew lease: %w", err)
 		}
 
-	case stale:
+	case available:
 		newEpoch := current.Epoch + 1
 		if _, err := tx.ExecContext(qCtx, `
 			UPDATE keeper.leader

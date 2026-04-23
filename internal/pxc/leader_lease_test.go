@@ -12,27 +12,30 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// TestLease_FirstInsertWhenTableEmpty covers the cold-start path: no row
-// exists yet, so AcquireOrRenewLease must INSERT with epoch=1 and come back
-// reporting us as the owner.
-func TestLease_FirstInsertWhenTableEmpty(t *testing.T) {
+// TestLease_FirstAcquireOnSeededRow covers the cold-start path where
+// EnsureLeaderLeaseSchema has pre-seeded keeper.leader with owner=''.
+// AcquireOrRenewLease sees owner=='' (treated as available) and takes over,
+// bumping epoch from 0 to 1.
+func TestLease_FirstAcquireOnSeededRow(t *testing.T) {
 	db, mock := newLeaseMock(t)
 	defer db.Close()
 
+	epoch0 := time.Unix(1, 0).UTC()
 	mock.ExpectBegin()
+	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
+		AddRow("", int64(0), epoch0, epoch0, "")
 	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1 FOR UPDATE").
-		WillReturnError(sql.ErrNoRows)
-	mock.ExpectExec("INSERT INTO keeper.leader").
-		WithArgs("dc-controller", "dc-controller").
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnRows(rows)
+	mock.ExpectExec("UPDATE keeper.leader SET owner = ?, epoch = ?, acquired_at = NOW").
+		WithArgs("dc-controller", int64(1), "dc-controller").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	// Second Get() called by AcquireOrRenewLease to return the freshly-written row.
 	now := time.Now().UTC()
-	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
+	refreshed := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
 		AddRow("dc-controller", int64(1), now, now, "dc-controller")
 	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1").
-		WillReturnRows(rows)
+		WillReturnRows(refreshed)
 
 	m := &Manager{dsn: "mock", timeout: 2 * time.Second}
 	lease, err := m.runAcquireOrRenew(context.Background(), db, "dc-controller", 30*time.Second)
