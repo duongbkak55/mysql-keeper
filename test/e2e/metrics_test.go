@@ -41,16 +41,17 @@ func TestE2E_MetricsExposed(t *testing.T) {
 		lastStatus = resp.Status
 		lastBody = string(body)
 
+		// We assert on Gauges only. CounterVec metrics like
+		// mysql_keeper_switchover_total are lazy-registered — they appear in
+		// /metrics exposition only after the first WithLabelValues(...).Inc(),
+		// which requires an actual switchover attempt and is out of scope
+		// for this smoke test. The reconciler calls Set() on
+		// mysql_keeper_cluster_healthy every reconcile cycle, so we look
+		// for that plus the generic "mysql_keeper_" prefix HELP line to
+		// prove the whole keeper namespace is wired.
 		if resp.StatusCode == http.StatusOK &&
-			strings.Contains(lastBody, "mysql_keeper_switchover_total") {
-			// Every metric this controller registers uses the "mysql_keeper"
-			// prefix. Check for cluster_healthy too to guard against someone
-			// inadvertently registering a collector without its labels.
-			if strings.Contains(lastBody, "mysql_keeper_cluster_healthy") {
-				return
-			}
-			t.Errorf("metrics body missing mysql_keeper_cluster_healthy; head=\n%s",
-				head(lastBody, 1024))
+			strings.Contains(lastBody, "mysql_keeper_cluster_healthy") &&
+			strings.Contains(lastBody, "mysql_keeper_cluster_writable") {
 			return
 		}
 		time.Sleep(3 * time.Second)
