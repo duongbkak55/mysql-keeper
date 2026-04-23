@@ -1,0 +1,71 @@
+# Local Tier D staging: two Percona 8.0 containers wired as DC → DR async
+# replication. Sufficient for D3 (root-cause GTID lag drill) and D4 (binlog
+# retention purge drill). D1/D2/D5 need a full Kubernetes staging cluster
+# with 2 real PXC clusters — out of scope for a laptop.
+#
+# Usage:
+#   scripts/local/staging-up.sh         # bring up + configure replication
+#   scripts/local/staging-down.sh       # tear down + wipe volumes
+#
+# Ports (on host):
+#   127.0.0.1:33061 → DC  MySQL
+#   127.0.0.1:33062 → DR  MySQL
+services:
+  dc:
+    image: percona/percona-server:8.0
+    container_name: keeper-stg-dc
+    restart: unless-stopped
+    command:
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-bin=/var/lib/mysql/binlog
+      - --log-replica-updates=ON
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=604800
+      - --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: stagingpass
+      MYSQL_DATABASE: keeper
+    ports:
+      - "127.0.0.1:33061:3306"
+    volumes:
+      - dc-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pstagingpass"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  dr:
+    image: percona/percona-server:8.0
+    container_name: keeper-stg-dr
+    restart: unless-stopped
+    command:
+      - --server-id=2
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-bin=/var/lib/mysql/binlog
+      - --log-replica-updates=ON
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=604800
+      - --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: stagingpass
+      MYSQL_DATABASE: keeper
+    ports:
+      - "127.0.0.1:33062:3306"
+    volumes:
+      - dr-data:/var/lib/mysql
+    depends_on:
+      dc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pstagingpass"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  dc-data:
+  dr-data:
