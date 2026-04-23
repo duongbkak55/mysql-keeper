@@ -50,6 +50,16 @@ func TestE2E_SwitchoverProgressCheckpointSurvivesRestart(t *testing.T) {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
 
+	// Confirm the seed is observable before bouncing. The controller cache
+	// is refreshed via watch; a read right after the patch proves the status
+	// subresource accepted our values.
+	verify := &mysqlv1alpha1.ClusterSwitchPolicy{}
+	mustGet(t, ctx, c, name, verify)
+	if verify.Status.SwitchoverProgress == nil ||
+		verify.Status.SwitchoverProgress.AttemptID != attemptID {
+		t.Fatalf("seeded SwitchoverProgress not persisted: %+v", verify.Status)
+	}
+
 	// Bounce the controller deployment. We do this by scaling to 0 and back
 	// to 2 via kubectl to avoid depending on the apps/v1 client just for
 	// one restart.

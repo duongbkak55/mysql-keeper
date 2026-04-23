@@ -49,6 +49,13 @@ func TestE2E_FinalizerBlocksDelete(t *testing.T) {
 		t.Fatalf("status patch: %v", err)
 	}
 
+	// Give the controller's informer a moment to observe the SwitchingOver
+	// phase we just wrote. Without this, handleDeletion runs against a cache
+	// view where Phase is still Monitoring and skips the "refuse to finalize
+	// during a switchover" branch — causing the finalizer to be removed and
+	// the CR to be GC'd.
+	time.Sleep(3 * time.Second)
+
 	// Issue Delete. k8s will set DeletionTimestamp but the finalizer is
 	// expected to prevent actual GC until we remove it.
 	if err := c.Delete(ctx, updated); err != nil {

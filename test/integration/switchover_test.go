@@ -41,6 +41,24 @@ func TestInteg_FullSwitchoverHappyPath(t *testing.T) {
 	dcMgr := pxc.NewRemoteManager(dcDSN, 5*time.Second)
 	drMgr := pxc.NewRemoteManager(drDSN, 5*time.Second)
 
+	// Create keeper.probe on DC (where it is writable) so that after DR is
+	// promoted its VerifyWrite can INSERT into the table. In production the
+	// controller's ensureKeeperSchema step does this; here we call Execute
+	// directly so we do the equivalent by hand. Replication carries the
+	// DDL over to DR before the flip.
+	if err := dcMgr.EnsureKeeperSchema(ctx); err != nil {
+		t.Fatalf("EnsureKeeperSchema on DC: %v", err)
+	}
+	// Give replication a beat to apply the CREATE TABLE on DR so the post-
+	// promote probe does not race the DDL.
+	dcGTID, err := dcMgr.GetExecutedGTID(ctx)
+	if err != nil {
+		t.Fatalf("read DC gtid: %v", err)
+	}
+	if err := drMgr.WaitForGTID(ctx, dcGTID, 15*time.Second); err != nil {
+		t.Fatalf("wait DR to apply keeper schema: %v", err)
+	}
+
 	// Route reverse-replication's "new source" stop inside the promote path.
 	// ReverseReplica phase is best-effort and DC will be re-attached as a
 	// replica by a later reconcile (Sprint 2+) — we only assert that it was
