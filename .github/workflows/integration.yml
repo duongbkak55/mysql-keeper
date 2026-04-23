@@ -1,0 +1,62 @@
+# Integration test workflow. Kept separate from the unit-test workflow so the
+# slow container pulls do not block PR merges that only change pure-Go logic.
+#
+# Triggered by:
+#   - pushes to main (post-merge verification)
+#   - pull requests that touch the test/integration/ directory, or that change
+#     replication/switchover code whose correctness is bound to real MySQL.
+#   - manual dispatch from the Actions tab.
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "test/integration/**"
+      - "internal/pxc/**"
+      - "internal/switchover/**"
+      - "internal/proxysql/**"
+      - ".github/workflows/integration.yml"
+  workflow_dispatch:
+
+jobs:
+  test-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Pre-pull container images
+        # Pulling ahead of testcontainers keeps the first test from timing
+        # out while Percona warms up. Image digest is pinned in test code.
+        run: |
+          docker pull percona/percona-server:8.0
+
+      - name: Run integration tests
+        env:
+          # testcontainers-go needs this on GitHub runners where the docker
+          # socket lives at the default location.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: |
+          go test -tags=integration \
+            -timeout=20m \
+            -count=1 \
+            -v \
+            ./test/integration/...
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          for c in $(docker ps -aq); do
+            echo "==== $c ===="
+            docker logs "$c" || true
+          done

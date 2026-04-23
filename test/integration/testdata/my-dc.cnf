@@ -1,0 +1,10 @@
+[mysqld]
+server-id = 1
+gtid_mode = ON
+enforce_gtid_consistency = ON
+log_bin = /var/lib/mysql/binlog
+binlog_format = ROW
+log_replica_updates = ON
+binlog_expire_logs_seconds = 604800
+read_only = OFF
+super_read_only = OFF
