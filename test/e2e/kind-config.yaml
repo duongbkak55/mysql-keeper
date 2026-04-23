@@ -1,0 +1,18 @@
+# kind cluster topology for the e2e suite.
+#
+# One control-plane + one worker is the smallest shape that lets us test
+# pod rescheduling behaviour (SwitchoverProgress checkpoint survives a pod
+# restart + move between nodes). Add more workers only if a future test
+# actually needs them — more nodes = more image pulls = slower runs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: keeper-e2e
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Expose the controller /metrics endpoint through the host so the test
+      # suite can scrape it without port-forwarding each time.
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+  - role: worker

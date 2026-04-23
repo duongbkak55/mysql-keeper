@@ -1,0 +1,83 @@
+# Minimal MySQL stub for the e2e suite. A single mysql:8.0 pod exposed as a
+# Service; we do NOT configure replication here because the e2e tests are
+# about controller plumbing, not replication semantics (Tier B covers that).
+#
+# The controller's CR samples point at this Service for both local and
+# remote endpoints; in a real deployment those would be separate MySQL
+# clusters in separate Kubernetes clusters.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mysql-keeper-e2e
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-stub-creds
+  namespace: mysql-keeper-e2e
+type: Opaque
+stringData:
+  username: root
+  password: e2e-password
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-stub
+  namespace: mysql-keeper-e2e
+spec:
+  serviceName: mysql-stub
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-stub
+  template:
+    metadata:
+      labels:
+        app: mysql-stub
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args:
+            - --gtid-mode=ON
+            - --enforce-gtid-consistency=ON
+            - --log-bin=/var/lib/mysql/binlog
+            - --log-replica-updates=ON
+            - --binlog-format=ROW
+            - --binlog-expire-logs-seconds=604800
+            - --server-id=1
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-stub-creds
+                  key: password
+          ports:
+            - containerPort: 3306
+              name: mysql
+          readinessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - "127.0.0.1"
+                - -u
+                - root
+                - -pe2e-password
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-stub
+  namespace: mysql-keeper-e2e
+spec:
+  selector:
+    app: mysql-stub
+  ports:
+    - port: 3306
+      targetPort: mysql
+  clusterIP: None

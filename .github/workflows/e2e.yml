@@ -1,0 +1,54 @@
+# E2E workflow: spin up kind, install the controller, run the Go e2e suite.
+# Like the integration workflow this is separate from unit tests so a slow
+# pull or flake cannot block PR merges.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "test/e2e/**"
+      - "scripts/e2e-*.sh"
+      - "internal/controller/**"
+      - "api/v1alpha1/**"
+      - "config/crd/**"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+
+jobs:
+  test-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Set up kind cluster + controller
+        run: ./scripts/e2e-setup.sh
+
+      - name: Run e2e tests
+        run: |
+          go test -tags=e2e -v -count=1 -timeout=20m ./test/e2e/...
+
+      - name: Dump controller logs on failure
+        if: failure()
+        run: |
+          kubectl -n mysql-keeper-system get pods
+          kubectl -n mysql-keeper-system logs -l app.kubernetes.io/name=mysql-keeper --tail=500 || true
+          kubectl -n mysql-keeper-system describe pods -l app.kubernetes.io/name=mysql-keeper || true
+
+      - name: Tear down kind
+        if: always()
+        run: ./scripts/e2e-teardown.sh
