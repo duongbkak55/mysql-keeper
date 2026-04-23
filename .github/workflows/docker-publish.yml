@@ -1,0 +1,124 @@
+# Build + push the controller image to Docker Hub.
+#
+# Triggers:
+#   - push to main          → publishes <user>/mysql-keeper:latest + :sha-<git-short-sha>
+#   - git tag matching v*   → additionally publishes :<tag> and :<major>.<minor>
+#   - manual workflow_dispatch
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DOCKERHUB_USERNAME  your Docker Hub username (e.g. "duongbkak55")
+#   DOCKERHUB_TOKEN     access token from https://hub.docker.com/settings/security
+#
+# Optional repository variable:
+#   DOCKERHUB_IMAGE     full image name, default "${DOCKERHUB_USERNAME}/mysql-keeper"
+#
+# First-time setup:
+#   1. Create the repo on Docker Hub (auto-created on first push if your token
+#      has the right scope, but an explicit repo lets you set description/
+#      readme up front).
+#   2. Create a Personal Access Token with "Read, Write, Delete" scope.
+#   3. Add DOCKERHUB_USERNAME + DOCKERHUB_TOKEN as repository secrets.
+#   4. Push a commit to main (or run "Run workflow" from the Actions tab).
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: "Optional additional tag to publish (e.g. rc-2026-04-24)"
+        required: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # Do not publish from forks — they will not have the secrets anyway, and
+    # a skipped run is less noisy than a failed one.
+    if: github.repository == 'duongbkak55/mysql-keeper'
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        run: |
+          IMAGE="${DOCKERHUB_IMAGE:-${{ secrets.DOCKERHUB_USERNAME }}/mysql-keeper}"
+          echo "name=${IMAGE}" >> "$GITHUB_OUTPUT"
+        env:
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+
+      - name: Set up QEMU
+        # QEMU lets buildx produce arm64 layers on the x86 runner. We ship
+        # both arches even though production today is amd64, so the image
+        # works out of the box on Apple Silicon + Raspberry Pi testbeds.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          image="${{ steps.image.outputs.name }}"
+          sha_short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          tags=("${image}:sha-${sha_short}")
+
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tags+=("${image}:latest")
+            tags+=("${image}:main")
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # v0.2.0 → 0.2.0 and 0.2 (major.minor)
+            ver="${GITHUB_REF#refs/tags/v}"
+            tags+=("${image}:${ver}")
+            # shellcheck disable=SC2206
+            parts=(${ver//./ })
+            if [[ ${#parts[@]} -ge 2 ]]; then
+              tags+=("${image}:${parts[0]}.${parts[1]}")
+            fi
+          fi
+
+          if [[ -n "${EXTRA_TAG:-}" ]]; then
+            tags+=("${image}:${EXTRA_TAG}")
+          fi
+
+          # buildx-friendly comma-joined list.
+          IFS=, ; joined="${tags[*]}" ; unset IFS
+          echo "tags=${joined}" >> "$GITHUB_OUTPUT"
+          printf 'Publishing tags:\n'
+          printf '  %s\n' "${tags[@]}"
+        env:
+          EXTRA_TAG: ${{ github.event.inputs.extra_tag }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # OCI labels — pulled by Docker Hub into the repo page + by registry
+          # UIs that render provenance metadata.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.title=mysql-keeper
+            org.opencontainers.image.description=K8s controller for automatic DC-DR PXC switchover
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,10 +1,11 @@
-# Build stage — runs on the host architecture (ARM or x86).
-# Go cross-compiles natively without QEMU: GOOS/GOARCH produce the correct binary.
-# Track whatever toolchain go.mod declares. The base tag picks the latest
-# minor release at image build time; the actual compiler version is then
-# auto-upgraded via GOTOOLCHAIN when a dependency bumps the go directive,
-# so no Dockerfile change is needed when deps pull in a newer toolchain.
-FROM golang:1-alpine AS builder
+# Build stage. BUILDPLATFORM is the runner's architecture; TARGETPLATFORM /
+# TARGETOS / TARGETARCH are the architecture we're cross-compiling FOR and
+# are injected automatically by `docker buildx build --platform=...`.
+# Running go on BUILDPLATFORM + setting GOOS/GOARCH from TARGETARCH avoids
+# the QEMU-in-Go-compiler slow path for every non-native arch.
+FROM --platform=$BUILDPLATFORM golang:1-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --no-cache git file
 
@@ -16,16 +17,17 @@ COPY cmd/ cmd/
 COPY api/ api/
 COPY internal/ internal/
 
-# Cross-compile for linux/amd64.
-# GONOSUMDB=* skips checksum DB (no go.sum needed upfront).
-# -mod=mod lets Go resolve and download modules inline without go mod tidy.
-RUN GONOSUMDB=* CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+# Cross-compile for the TARGETARCH the buildx platform requested. For
+# non-buildx (plain `docker build`) TARGETOS/TARGETARCH are unset and the
+# shell defaults substitute the runner's arch, giving the old behaviour.
+RUN GONOSUMDB=* CGO_ENABLED=0 \
+    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -mod=mod -a -ldflags="-s -w" -o manager ./cmd/main.go
 
-# Verify the binary is actually amd64.
+# Verify the binary is actually the architecture we asked for.
 RUN file manager
 
-# Final image — explicitly amd64 platform.
+# Final image.
 FROM scratch
 
 WORKDIR /
