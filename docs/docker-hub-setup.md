@@ -85,6 +85,40 @@ images:
 Or pass it to `scripts/e2e-setup.sh` via `IMAGE=duongbkak55/mysql-keeper:latest`
 for ad-hoc testing against the published image.
 
+## Syncing the repository description (optional)
+
+The workflow tries to upload `docs/dockerhub-overview.md` as the Docker Hub
+repo README on every push to `main`. That step calls
+`PATCH /v2/repositories/{namespace}/{repo}`, which Docker Hub grants **only
+to account-level auth**:
+
+- Your account **password** (not recommended in CI), or
+- A **Personal Access Token with the account-admin scope**, which is a
+  separate scope from the image push/pull scope.
+
+A standard "Read, Write, Delete" PAT (the one used for image push) returns
+`403 Forbidden` on this endpoint. The workflow marks the description step
+`continue-on-error: true` so the image still publishes — only the auto-
+README sync is skipped.
+
+Two ways to enable it:
+
+**Option A — manual paste (simplest, no extra scope):**
+
+1. Copy the contents of
+   [`docs/dockerhub-overview.md`](./dockerhub-overview.md).
+2. Paste into the "Repository Overview" field at
+   `https://hub.docker.com/r/<namespace>/mysql-keeper/~/edit/`.
+3. Re-do on every material change to the overview — rare.
+
+**Option B — dedicated description token:**
+
+1. On Docker Hub, create a second PAT named `github-description-sync`
+   with **"Admin" scope** (granular scope "Read & Write" → "Accounts").
+2. Add it as a GitHub secret called `DOCKERHUB_DESCRIPTION_TOKEN`
+   (the workflow already falls back to it before `DOCKERHUB_TOKEN`).
+3. Re-run the workflow — the step should now succeed.
+
 ## Troubleshooting
 
 - **`UNAUTHORIZED: authentication required`** — the PAT expired or was

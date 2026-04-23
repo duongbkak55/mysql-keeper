@@ -124,15 +124,20 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Update Docker Hub repository description
-        # Sync docs/dockerhub-overview.md to the repo's README on Docker Hub
-        # so visitors see the full usage + sample-CR pointers without having
-        # to click through to GitHub. Only runs on main so feature-branch
-        # experiments do not overwrite the published description.
+        # Sync docs/dockerhub-overview.md to the repo's README on Docker Hub.
+        # continue-on-error because the Docker Hub description API needs a
+        # different token scope than the image-push PAT — if the token was
+        # generated with only "Read, Write, Delete" scope the PATCH returns
+        # 403 Forbidden and the image push itself is the thing we care about.
+        # To enable automated description sync, generate a second PAT with
+        # scope "Read & Write" (Public Repo + Account) and use that for this
+        # step — see docs/docker-hub-setup.md.
         if: github.ref == 'refs/heads/main'
+        continue-on-error: true
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_DESCRIPTION_TOKEN || secrets.DOCKERHUB_TOKEN }}
           repository: ${{ steps.image.outputs.name }}
           short-description: "K8s controller for automatic DC-DR Percona XtraDB Cluster switchover"
           readme-filepath: docs/dockerhub-overview.md
