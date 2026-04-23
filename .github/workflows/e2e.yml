@@ -36,7 +36,11 @@ jobs:
           install_only: true
 
       - name: Set up kind cluster + controller
-        run: ./scripts/e2e-setup.sh
+        # Invoke via bash explicitly: repo files lose the +x bit through git
+        # on Windows checkouts, and the default file mode on Linux runners
+        # would fail with "Permission denied". Running via bash avoids any
+        # dependency on the stored mode bit.
+        run: bash ./scripts/e2e-setup.sh
 
       - name: Run e2e tests
         run: |
@@ -51,4 +55,4 @@ jobs:
 
       - name: Tear down kind
         if: always()
-        run: ./scripts/e2e-teardown.sh
+        run: bash ./scripts/e2e-teardown.sh

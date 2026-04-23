@@ -118,18 +118,17 @@ func TestMain(m *testing.M) {
 // Any failure here is fatal for the suite — a replication-based test cannot
 // run without replication.
 func setupAsyncReplication(ctx context.Context, dcDSN, drDSN, dcInternalIP string) error {
-	dc, err := sql.Open("mysql", dcDSN)
+	dc, err := openWithRetries(ctx, dcDSN, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("open DC: %w", err)
 	}
 	defer dc.Close()
-	if err := dc.PingContext(ctx); err != nil {
-		return fmt.Errorf("ping DC: %w", err)
-	}
 
-	// Replication grants — keep them idempotent so re-running the suite
-	// against a cached container works.
-	stmts := []string{
+	// Replication grants — idempotent so re-running the suite against a
+	// cached container works. Run each on a fresh dedicated connection to
+	// avoid stale-pool EOFs; the container has enough slack during startup
+	// to kill pooled connections that were opened during warm-up.
+	for _, s := range []string{
 		fmt.Sprintf(`CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'`, replUser, replPass),
 		fmt.Sprintf(`GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%'`, replUser),
 		`FLUSH PRIVILEGES`,
@@ -139,21 +138,25 @@ func setupAsyncReplication(ctx context.Context, dcDSN, drDSN, dcInternalIP strin
 			cluster_id VARCHAR(8) NOT NULL,
 			ts DATETIME(6) NOT NULL DEFAULT NOW(6)
 		)`,
-	}
-	for _, s := range stmts {
-		if _, err := dc.ExecContext(ctx, s); err != nil {
+	} {
+		if err := execWithRetries(ctx, dc, s, 5); err != nil {
 			return fmt.Errorf("DC stmt %q: %w", s, err)
 		}
 	}
 
-	dr, err := sql.Open("mysql", drDSN)
+	dr, err := openWithRetries(ctx, drDSN, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("open DR: %w", err)
 	}
 	defer dr.Close()
 
-	// Point DR at DC on the docker network. We use port 3306 (container
-	// port), not the host-mapped one.
+	// Best-effort idempotency — skip errors when the channel has never been
+	// configured on this container. We pass context.Background() here so the
+	// setup-wide timeout does not cancel the subsequent CHANGE REPLICATION
+	// SOURCE if these take a few hundred ms.
+	_, _ = dr.ExecContext(ctx, fmt.Sprintf(`STOP REPLICA FOR CHANNEL '%s'`, channelName))
+	_, _ = dr.ExecContext(ctx, fmt.Sprintf(`RESET REPLICA ALL FOR CHANNEL '%s'`, channelName))
+
 	change := fmt.Sprintf(`
 		CHANGE REPLICATION SOURCE TO
 			SOURCE_HOST='%s',
@@ -164,20 +167,12 @@ func setupAsyncReplication(ctx context.Context, dcDSN, drDSN, dcInternalIP strin
 			SOURCE_HEARTBEAT_PERIOD=2,
 			GET_SOURCE_PUBLIC_KEY=1
 		FOR CHANNEL '%s'`, dcInternalIP, replUser, replPass, channelName)
-	drStmts := []string{
-		fmt.Sprintf(`STOP REPLICA FOR CHANNEL '%s'`, channelName), // idempotent
-		fmt.Sprintf(`RESET REPLICA ALL FOR CHANNEL '%s'`, channelName),
-		change,
-		fmt.Sprintf(`START REPLICA FOR CHANNEL '%s'`, channelName),
+	if err := execWithRetries(ctx, dr, change, 5); err != nil {
+		return fmt.Errorf("CHANGE REPLICATION SOURCE: %w", err)
 	}
-	for _, s := range drStmts {
-		if _, err := dr.ExecContext(ctx, s); err != nil {
-			// STOP/RESET on an unconfigured channel returns an error — that
-			// is expected on the first run. Only the START must succeed.
-			if s == change || s == fmt.Sprintf(`START REPLICA FOR CHANNEL '%s'`, channelName) {
-				return fmt.Errorf("DR stmt %q: %w", s, err)
-			}
-		}
+	if err := execWithRetries(ctx, dr,
+		fmt.Sprintf(`START REPLICA FOR CHANNEL '%s'`, channelName), 5); err != nil {
+		return fmt.Errorf("START REPLICA: %w", err)
 	}
 
 	// Sanity-wait: replication must become Running within 30s.
@@ -200,6 +195,94 @@ func setupAsyncReplication(ctx context.Context, dcDSN, drDSN, dcInternalIP strin
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("replication did not become Running within 30s")
+}
+
+// openWithRetries ping-loops until MySQL accepts connections. The
+// "ready for connections" log the Percona image prints can fire before the
+// auth subsystem is fully primed; pooled connections opened in that window
+// are prone to EOF on the first real query.
+func openWithRetries(ctx context.Context, dsn string, budget time.Duration) (*sql.DB, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the pool small and short-lived during setup so we do not reuse a
+	// connection that was negotiated before the server was really ready.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Second)
+	db.SetConnMaxIdleTime(5 * time.Second)
+
+	deadline := time.Now().Add(budget)
+	for {
+		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err = db.PingContext(pingCtx)
+		cancel()
+		if err == nil {
+			return db, nil
+		}
+		if time.Now().After(deadline) {
+			db.Close()
+			return nil, fmt.Errorf("ping within %s: %w", budget, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// execWithRetries retries transient "bad connection" / EOF errors that happen
+// when the server recycles a pooled connection during startup. Production
+// code runs long after warm-up and does not need this.
+func execWithRetries(ctx context.Context, db *sql.DB, stmt string, attempts int) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		_, err := db.ExecContext(ctx, stmt)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		msg := err.Error()
+		if !isTransientConnErr(msg) {
+			return err
+		}
+		time.Sleep(time.Duration(200+(i*300)) * time.Millisecond)
+	}
+	return lastErr
+}
+
+func isTransientConnErr(msg string) bool {
+	// go-sql-driver/mysql surfaces both "driver: bad connection" and
+	// "invalid connection" when the server closes mid-handshake.
+	return containsAny(msg,
+		"bad connection",
+		"invalid connection",
+		"unexpected EOF",
+		"connection reset by peer",
+	)
+}
+
+func containsAny(s string, needles ...string) bool {
+	for _, n := range needles {
+		if len(n) > 0 && len(s) >= len(n) {
+			if indexOf(s, n) >= 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// indexOf avoids importing strings just for the one call on the hot path.
+func indexOf(s, substr string) int {
+	n := len(substr)
+	if n == 0 {
+		return 0
+	}
+	for i := 0; i+n <= len(s); i++ {
+		if s[i:i+n] == substr {
+			return i
+		}
+	}
+	return -1
 }
 
 func terminate(ctx context.Context, c testcontainers.Container, label string) {
