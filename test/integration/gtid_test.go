@@ -48,10 +48,7 @@ func TestInteg_GTIDSubsetFail_LagInjected(t *testing.T) {
 		`STOP REPLICA SQL_THREAD FOR CHANNEL 'dc-to-dr'`); err != nil {
 		t.Fatalf("STOP REPLICA SQL_THREAD: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = dr.ExecContext(context.Background(),
-			`START REPLICA SQL_THREAD FOR CHANNEL 'dc-to-dr'`)
-	})
+	t.Cleanup(func() { restartReplicaThread(t, "SQL_THREAD") })
 
 	// Write 100 sentinels on DC. These will not land on DR while the applier
 	// is stopped. GTID_SUBTRACT(dc, dr) will therefore be non-empty.
@@ -98,10 +95,7 @@ func TestInteg_WaitForGTIDTimeout(t *testing.T) {
 		`STOP REPLICA SQL_THREAD FOR CHANNEL 'dc-to-dr'`); err != nil {
 		t.Fatalf("STOP: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = dr.ExecContext(context.Background(),
-			`START REPLICA SQL_THREAD FOR CHANNEL 'dc-to-dr'`)
-	})
+	t.Cleanup(func() { restartReplicaThread(t, "SQL_THREAD") })
 	dcGtid := writeOnDC(ctx, t, 50)
 
 	rm := pxc.NewRemoteManager(drDSN, 5*time.Second)
@@ -132,10 +126,7 @@ func TestInteg_ReplicationChannelBroken(t *testing.T) {
 		`STOP REPLICA IO_THREAD FOR CHANNEL 'dc-to-dr'`); err != nil {
 		t.Fatalf("STOP IO: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = dr.ExecContext(context.Background(),
-			`START REPLICA IO_THREAD FOR CHANNEL 'dc-to-dr'`)
-	})
+	t.Cleanup(func() { restartReplicaThread(t, "IO_THREAD") })
 
 	pf := buildPreflight()
 	res := pf.Run(ctx)
@@ -207,6 +198,26 @@ func waitForReplica(ctx context.Context, t *testing.T, gtid string) {
 	rm := pxc.NewRemoteManager(drDSN, 5*time.Second)
 	if err := rm.WaitForGTID(ctx, gtid, 30*time.Second); err != nil {
 		t.Fatalf("waitForReplica: %v", err)
+	}
+}
+
+// restartReplicaThread reopens a short-lived DR connection and runs
+// `START REPLICA <thread> FOR CHANNEL ...`. Used from t.Cleanup — we cannot
+// reuse the test-scoped DB because `defer dr.Close()` in the test body runs
+// before cleanup functions fire, leaving the captured *sql.DB closed.
+func restartReplicaThread(t *testing.T, thread string) {
+	t.Helper()
+	db, err := sql.Open("mysql", drDSN)
+	if err != nil {
+		t.Logf("cleanup: open DR: %v", err)
+		return
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx,
+		"START REPLICA "+thread+" FOR CHANNEL '"+channelName+"'"); err != nil {
+		t.Logf("cleanup START REPLICA %s: %v", thread, err)
 	}
 }
 

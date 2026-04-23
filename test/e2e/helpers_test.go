@@ -16,7 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/tools/clientcmd"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
@@ -44,10 +43,11 @@ func newClient(t *testing.T) client.Client {
 		t.Fatalf("build kubeconfig from %s: %v", kubeconfig, err)
 	}
 
+	// SetupSignalHandler registers signal channels internally via a sync.Once
+	// that panics on second call. e2e tests create a client per test, so we
+	// must NOT call it here. A test-scoped context is built via
+	// context.WithTimeout in the individual tests instead.
 	scheme := runtime.NewScheme()
-	if err := ctrl.SetupSignalHandler().Err(); err != nil {
-		_ = err // ignore — we just want the signal context side-effect elsewhere
-	}
 	if err := mysqlv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add CSP scheme: %v", err)
 	}
@@ -87,6 +87,21 @@ func fixtureCSP(name string) *mysqlv1alpha1.ClusterSwitchPolicy {
 				CredentialsSecretRef: mysqlv1alpha1.SecretRef{
 					Name:      "mysql-stub-creds",
 					Namespace: "mysql-keeper-e2e",
+				},
+			},
+			// ProxySQL is a required CRD field. The e2e tests don't exercise
+			// ProxySQL routing, so we hand in a single placeholder endpoint
+			// pointing at nowhere-reachable — the controller's ProxySQL
+			// health check will report it unreachable but the reconciler
+			// does not crash on that.
+			ProxySQL: []mysqlv1alpha1.ProxySQLEndpoint{
+				{
+					Host:      "proxysql-stub.mysql-keeper-e2e.svc.cluster.local",
+					AdminPort: 6032,
+					CredentialsSecretRef: mysqlv1alpha1.SecretRef{
+						Name:      "mysql-stub-creds",
+						Namespace: "mysql-keeper-e2e",
+					},
 				},
 			},
 			HealthCheck: mysqlv1alpha1.HealthCheckConfig{

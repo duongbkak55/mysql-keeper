@@ -117,8 +117,12 @@ func TestMain(m *testing.M) {
 		log.Fatalf("DC ContainerIP: %v", err)
 	}
 
-	dcDSN = fmt.Sprintf("root:%s@tcp(%s:%s)/", rootPW, dcHost, dcPort.Port())
-	drDSN = fmt.Sprintf("root:%s@tcp(%s:%s)/", rootPW, drHost, drPort.Port())
+	// parseTime=true is required so *time.Time Scan targets (e.g. the
+	// keeper.leader lease row) work against real MySQL. Without it the
+	// driver hands back []byte and Scan errors with "unsupported Scan".
+	// loc=Local keeps timestamp comparisons consistent with time.Now().
+	dcDSN = fmt.Sprintf("root:%s@tcp(%s:%s)/?parseTime=true&loc=Local", rootPW, dcHost, dcPort.Port())
+	drDSN = fmt.Sprintf("root:%s@tcp(%s:%s)/?parseTime=true&loc=Local", rootPW, drHost, drPort.Port())
 
 	if err := setupAsyncReplication(ctx, dcDSN, drDSN, dcContainerIP); err != nil {
 		log.Fatalf("setup replication: %v", err)
