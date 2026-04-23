@@ -18,6 +18,15 @@
 #   both-ro-clear  Undo the previous command.
 #
 #   status       Print a one-line summary of each cluster.
+#
+#   purge-gtid   The actual production incident end state: stop DR's IO
+#                thread, write on DC, rotate + PURGE BINARY LOGS so the
+#                GTIDs DR is missing no longer exist in DC's binlog, then
+#                resume DR. Result: Last_IO_Errno=1236
+#                (ER_MASTER_HAS_PURGED_REQUIRED_GTIDS).
+#                The only clean recovery is re-seed DR from DC via
+#                xtrabackup — that is out of scope for this drill, so run
+#                scripts/local/pxc-down.sh + pxc-up.sh to reset.
 set -euo pipefail
 
 ROOT_PW="stagingpass"
@@ -73,6 +82,71 @@ case "${1:-}" in
     mysql_dc "SET GLOBAL super_read_only=OFF"
     ;;
 
+  purge-gtid)
+    echo ">> Reproducing ER_MASTER_HAS_PURGED_REQUIRED_GTIDS (Error 1236)"
+    echo ">> This is the end state the production incident reached — after a flip"
+    echo ">> when DR was behind, DC eventually purged the binlogs DR still needed."
+    echo
+
+    echo "== STEP 1: stop DR IO thread so no more events land"
+    mysql_dr "STOP REPLICA IO_THREAD FOR CHANNEL '${CHANNEL}'"
+
+    echo "== STEP 2: write rows on DC + rotate binlogs"
+    # Each mysql_dc call launches a separate docker-exec, so we batch the
+    # writes into a single multi-value INSERT. The cluster_id column is
+    # VARCHAR(8), so the payload fits in "dc".
+    values=$(printf '("dc"),%.0s' $(seq 1 200) | sed 's/,$//')
+    mysql_dc "INSERT INTO smoketest.pings (cluster_id) VALUES ${values}"
+    # FLUSH rotates — the old file carries the GTIDs DR still needs.
+    mysql_dc "FLUSH BINARY LOGS"
+    # Write more so the new file is current (retention measures file age).
+    mysql_dc "INSERT INTO smoketest.pings (cluster_id) VALUES ${values}"
+
+    echo "== STEP 3: purge DC binlogs — the GTIDs DR is missing are gone"
+    # PURGE BINARY LOGS BEFORE NOW() deletes every file strictly older than
+    # the current position. Since we rotated above, the file holding the
+    # missing GTIDs is now "old" and gets removed.
+    mysql_dc "PURGE BINARY LOGS BEFORE NOW()"
+
+    dc_purged=$(mysql_dc "SELECT @@GLOBAL.gtid_purged")
+    dc_executed=$(mysql_dc "SELECT @@GLOBAL.gtid_executed")
+    dr_executed=$(mysql_dr "SELECT @@GLOBAL.gtid_executed")
+    echo "   DC gtid_purged:   ${dc_purged}"
+    echo "   DC gtid_executed: ${dc_executed}"
+    echo "   DR gtid_executed: ${dr_executed}"
+
+    echo "== STEP 4: start DR IO thread — the IO handshake asks DC for the"
+    echo "           purged GTIDs and DC refuses, surfacing Error 1236."
+    mysql_dr "START REPLICA IO_THREAD FOR CHANNEL '${CHANNEL}'"
+
+    # Give the IO thread a moment to hit the error.
+    sleep 4
+
+    echo
+    echo "== STEP 5: inspect DR IO state"
+    docker exec -i keeper-pxc-dr mysql -uroot -p"${ROOT_PW}" -e "SHOW REPLICA STATUS\G" 2>/dev/null \
+      | grep -E 'Replica_IO_Running|Last_IO_Errno|Last_IO_Error'
+
+    # MySQL 8.0 stores two distinct values on an IO failure:
+    #   - Last_IO_Errno: client-side transport code (often 13114)
+    #   - Last_IO_Error: message string from the source server, which for
+    #     our case begins "Got fatal error 1236 from source ..."
+    # The production incident identifier is 1236 in the message, not the
+    # transport errno, so we match on the message body.
+    io_err_msg=$(mysql_dr "SELECT last_error_message FROM performance_schema.replication_connection_status WHERE channel_name='${CHANNEL}'")
+    echo
+    if echo "${io_err_msg}" | grep -qE 'error 1236|purged required binary logs'; then
+      echo "✅ Reproduced ER_MASTER_HAS_PURGED_REQUIRED_GTIDS."
+      echo "   This is the exact failure mode preflight C5 + C6 prevent when the"
+      echo "   controller refuses a flip while DR is behind. The only recovery"
+      echo "   from this state in production is xtrabackup re-seed of DR."
+    else
+      echo "⚠  Expected 'error 1236' or 'purged required binary logs' in the"
+      echo "   Last_IO_Error message; got: ${io_err_msg}"
+      echo "   Binlog may still have the missing GTIDs. Try ROWS=500 and re-run."
+    fi
+    ;;
+
   status)
     printf 'DC: read_only=%s  wsrep_cluster_status=%s  gtid_executed=%s\n' \
       "$(mysql_dc 'SELECT @@read_only')" \
@@ -88,7 +162,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "Usage: $0 {lag|recover|both-ro|both-ro-clear|status}"
+    echo "Usage: $0 {lag|recover|both-ro|both-ro-clear|purge-gtid|status}"
     exit 2
     ;;
 esac

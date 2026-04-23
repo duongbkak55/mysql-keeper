@@ -110,7 +110,41 @@ scripts/local/pxc-preflight.sh
 
 Replication catches up → preflight returns OK again.
 
-## Step 6 (optional) — Simulate "both clusters ReadOnly"
+## Step 6 (optional) — Reproduce the exact Error 1236 state
+
+The production incident eventually materialised as `ER_MASTER_HAS_PURGED_
+REQUIRED_GTIDS`. Preflight C5/C6 block the earlier step that would have
+led to this, but it is useful to see the end state once so the alert text
+in production logs is familiar:
+
+```bash
+bash scripts/local/pxc-bug-simulate.sh purge-gtid
+```
+
+What the script does:
+
+1. Stops DR's IO thread (buffering new events halts).
+2. Writes 200 rows on DC → binlog grows.
+3. `FLUSH BINARY LOGS` rotates to a new file; the old one still has the
+   GTIDs DR is missing.
+4. `PURGE BINARY LOGS BEFORE NOW()` removes the old file — now DC no
+   longer has the events DR needs.
+5. Starts DR's IO thread — the replica asks DC for the purged GTIDs, DC
+   refuses, the IO thread hits:
+
+   ```
+   Got fatal error 1236 from source when reading data from binary log:
+     'Cannot replicate because the source purged required binary logs.
+      Replicate the missing transactions from elsewhere, or provision
+      a new replica from backup. Consider increasing the source's binary
+      log expiration period. ...'
+   ```
+
+This is an unrecoverable state — the only production fix is re-seeding DR
+from an xtrabackup of DC. To reset the local staging, run
+`scripts/local/pxc-down.sh` + `scripts/local/pxc-up.sh`.
+
+## Step 7 (optional) — Simulate "both clusters ReadOnly"
 
 In real production the original incident also involved a cluster-wide
 quorum loss on DC that set `read_only=ON` automatically. We reproduce
@@ -135,7 +169,7 @@ Restore writability when done:
 scripts/local/pxc-bug-simulate.sh both-ro-clear
 ```
 
-## Step 7 — Tear down
+## Step 8 — Tear down
 
 ```bash
 scripts/local/pxc-down.sh
