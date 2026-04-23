@@ -1,0 +1,103 @@
+# Local PXC reproduction environment: two independent single-node Percona
+# XtraDB Cluster deployments linked by async GTID replication. Uses the
+# real percona-xtradb-cluster:8.0 image so wsrep_* status variables work as
+# in production (the standalone-percona staging cannot reproduce "cluster
+# went non-Primary → both clusters ReadOnly" — that is PXC-specific).
+#
+# Single-node is deliberate:
+#   * It's the minimum that still exposes the wsrep wire protocol.
+#   * The bug we are reproducing is triggered by the cluster going RO, which
+#     we simulate via SET GLOBAL read_only=ON on the sole node. In real
+#     production that state is auto-set by Galera when quorum is lost; the
+#     controller's observable input is identical either way.
+#
+# Resource budget: ~2 GB RAM, ~1 min startup. For real multi-node quorum
+# testing, scale the compose to 3 nodes per cluster manually (out of scope
+# for the bug-repro flow).
+services:
+  pxc-dc:
+    image: percona/percona-xtradb-cluster:8.0
+    container_name: keeper-pxc-dc
+    restart: unless-stopped
+    command:
+      # Galera bootstrap — first + only node of DC cluster.
+      - "--wsrep-new-cluster"
+      - "--wsrep-cluster-name=dc-cluster"
+      - "--wsrep-cluster-address=gcomm://"
+      - "--wsrep-node-name=pxc-dc"
+      - "--wsrep-node-address=pxc-dc"
+      - "--wsrep-sst-method=xtrabackup-v2"
+      # Async replication requirements (C7, C8, C9 preflight checks).
+      - "--server-id=101"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      - "--log-bin=/var/lib/mysql/binlog"
+      - "--log-replica-updates=ON"
+      - "--binlog-format=ROW"
+      - "--binlog-expire-logs-seconds=604800"
+      - "--default-authentication-plugin=mysql_native_password"
+      # Disable reverse-DNS of client IPs — otherwise every new connection
+      # waits ~10s on the server's glibc getnameinfo() against loopback IPs.
+      - "--skip-name-resolve"
+    environment:
+      MYSQL_ROOT_PASSWORD: stagingpass
+      MYSQL_DATABASE: keeper
+      CLUSTER_NAME: dc-cluster
+    ports:
+      - "127.0.0.1:33011:3306"
+    volumes:
+      - pxc-dc-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pstagingpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  pxc-dr:
+    image: percona/percona-xtradb-cluster:8.0
+    container_name: keeper-pxc-dr
+    restart: unless-stopped
+    command:
+      - "--wsrep-new-cluster"
+      - "--wsrep-cluster-name=dr-cluster"
+      - "--wsrep-cluster-address=gcomm://"
+      - "--wsrep-node-name=pxc-dr"
+      - "--wsrep-node-address=pxc-dr"
+      - "--wsrep-sst-method=xtrabackup-v2"
+      - "--server-id=201"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      - "--log-bin=/var/lib/mysql/binlog"
+      - "--log-replica-updates=ON"
+      - "--binlog-format=ROW"
+      - "--binlog-expire-logs-seconds=604800"
+      - "--default-authentication-plugin=mysql_native_password"
+      # Disable reverse-DNS of client IPs — otherwise every new connection
+      # waits ~10s on the server's glibc getnameinfo() against loopback IPs.
+      - "--skip-name-resolve"
+      # PXC quirk: when a PXC node acts as an async replica, the parallel
+      # applier (replica_parallel_workers>0) deadlocks against wsrep commit-
+      # order tracking with "Waiting for dependent transaction to commit".
+      # Force single-threaded applier so our test channel actually drains.
+      - "--replica-parallel-workers=0"
+      - "--replica-preserve-commit-order=OFF"
+    environment:
+      MYSQL_ROOT_PASSWORD: stagingpass
+      MYSQL_DATABASE: keeper
+      CLUSTER_NAME: dr-cluster
+    ports:
+      - "127.0.0.1:33012:3306"
+    volumes:
+      - pxc-dr-data:/var/lib/mysql
+    depends_on:
+      pxc-dc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pstagingpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  pxc-dc-data:
+  pxc-dr-data:
