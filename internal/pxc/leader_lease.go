@@ -100,9 +100,6 @@ func (m *Manager) GetLeaderLease(ctx context.Context) (LeaderLease, error) {
 //   - If the caller already owns the lease, refreshes heartbeat_at (no epoch bump).
 //   - If another owner holds a fresh lease, returns ErrLeaseHeldElsewhere.
 //   - If another owner holds a stale lease, takes over by bumping epoch.
-//
-// The function runs inside a transaction with SELECT ... FOR UPDATE to avoid
-// two controllers racing against the same row.
 func (m *Manager) AcquireOrRenewLease(
 	ctx context.Context,
 	ownerID string,
@@ -116,7 +113,18 @@ func (m *Manager) AcquireOrRenewLease(
 		return LeaderLease{}, err
 	}
 	defer db.Close()
+	return m.runAcquireOrRenew(ctx, db, ownerID, ttl)
+}
 
+// runAcquireOrRenew is the DB-operations half of AcquireOrRenewLease, split
+// out so tests can substitute a sqlmock-backed *sql.DB. Runs inside a
+// transaction with SELECT ... FOR UPDATE so two controllers cannot race.
+func (m *Manager) runAcquireOrRenew(
+	ctx context.Context,
+	db *sql.DB,
+	ownerID string,
+	ttl time.Duration,
+) (LeaderLease, error) {
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
@@ -134,7 +142,6 @@ func (m *Manager) AcquireOrRenewLease(
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// First-ever acquisition — insert.
 		if _, err := tx.ExecContext(qCtx, `
 			INSERT INTO keeper.leader (id, owner, epoch, acquired_at, heartbeat_at, renewed_by)
 			VALUES (1, ?, 1, NOW(6), NOW(6), ?)`,
@@ -144,7 +151,7 @@ func (m *Manager) AcquireOrRenewLease(
 		if err := tx.Commit(); err != nil {
 			return LeaderLease{}, fmt.Errorf("commit initial lease: %w", err)
 		}
-		return m.GetLeaderLease(ctx)
+		return m.getLeaseOnDB(ctx, db)
 
 	case err != nil:
 		return LeaderLease{}, fmt.Errorf("select keeper.leader: %w", err)
@@ -155,7 +162,6 @@ func (m *Manager) AcquireOrRenewLease(
 
 	switch {
 	case current.Owner == ownerID:
-		// Renew heartbeat, keep epoch.
 		if _, err := tx.ExecContext(qCtx, `
 			UPDATE keeper.leader
 			SET heartbeat_at = NOW(6), renewed_by = ?
@@ -164,7 +170,6 @@ func (m *Manager) AcquireOrRenewLease(
 		}
 
 	case stale:
-		// Previous owner went away — take over with a new epoch.
 		newEpoch := current.Epoch + 1
 		if _, err := tx.ExecContext(qCtx, `
 			UPDATE keeper.leader
@@ -176,12 +181,24 @@ func (m *Manager) AcquireOrRenewLease(
 		}
 
 	default:
-		// Peer holds a fresh lease — refuse.
 		return current, ErrLeaseHeldElsewhere
 	}
 
 	if err := tx.Commit(); err != nil {
 		return LeaderLease{}, fmt.Errorf("commit lease write: %w", err)
 	}
-	return m.GetLeaderLease(ctx)
+	return m.getLeaseOnDB(ctx, db)
+}
+
+// getLeaseOnDB returns the lease row using the provided connection. Used by
+// runAcquireOrRenew (to avoid opening a second connection and by tests).
+func (m *Manager) getLeaseOnDB(ctx context.Context, db *sql.DB) (LeaderLease, error) {
+	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	var l LeaderLease
+	err := db.QueryRowContext(qCtx, `
+		SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by
+		FROM keeper.leader WHERE id = 1`,
+	).Scan(&l.Owner, &l.Epoch, &l.AcquiredAt, &l.HeartbeatAt, &l.RenewedBy)
+	return l, err
 }

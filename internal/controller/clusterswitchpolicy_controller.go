@@ -310,58 +310,15 @@ func (r *ClusterSwitchPolicyReconciler) decideSwitchover(
 ) (reason string, should bool) {
 	logger := log.FromContext(ctx)
 
-	// 1. Cooldown check applies to both manual and auto triggers.
-	if policy.Status.LastSwitchoverTime != nil {
-		cooldown := policy.Spec.Switchover.CooldownPeriod.Duration
-		if cooldown <= 0 {
-			cooldown = 10 * time.Minute
-		}
-		since := time.Since(policy.Status.LastSwitchoverTime.Time)
-		if since < cooldown {
-			logger.Info("Switchover cooldown active — skipping",
-				"sinceLast", since.String(),
-				"cooldown", cooldown.String())
-			metrics.CooldownBlocked.WithLabelValues(policy.Spec.ClusterRole).Inc()
-			return "", false
-		}
-	}
-
-	// 2. Manual trigger.
-	if policy.Spec.ManualSwitchoverTarget == "promote-remote" {
-		return "manual switchover requested via spec.manualSwitchoverTarget", true
-	}
-
-	// 3. Automatic failover.
-	if !policy.Spec.AutoFailover {
-		return "", false
-	}
-	if policy.Status.ConsecutiveLocalFailures < policy.Spec.HealthCheck.FailureThreshold {
-		return "", false
-	}
-
-	// Both-ReadOnly guard: this is the exact scenario that triggered the
-	// production incident (both clusters RO because of cluster-wide quorum
-	// loss). The right action is to alert a human, not to flip direction.
-	if localHealth.Writable == health.WritableNo && remoteHealth.Writable == health.WritableNo {
-		logger.Info("Both clusters ReadOnly — cluster-wide incident, refusing auto-failover",
-			"localMsg", localHealth.Message,
-			"remoteMsg", remoteHealth.Message)
+	decision := EvaluateSwitchover(policy, localHealth, remoteHealth, time.Now())
+	switch decision.Blocker {
+	case "cooldown":
+		metrics.CooldownBlocked.WithLabelValues(policy.Spec.ClusterRole).Inc()
+	case "both_readonly":
 		metrics.BothClustersReadOnly.WithLabelValues(policy.Spec.ClusterRole).Inc()
-		return "", false
 	}
-
-	// Standard auto-failover conditions: local is unreachable / unhealthy, but
-	// the remote is reachable and safely read-only.
-	if remoteHealth.Writable != health.WritableNo {
-		logger.Info("Local unhealthy but remote not safe to promote — skipping",
-			"remoteWritable", remoteHealth.Writable.String(),
-			"remoteHealthy", remoteHealth.Healthy)
-		return "", false
-	}
-
-	if !remoteHealth.Healthy {
-		logger.Info("Local unhealthy but remote is also unhealthy — skipping",
-			"remoteMsg", remoteHealth.Message)
+	if !decision.Should {
+		logger.Info("EvaluateSwitchover rejected flip", "reason", decision.Reason)
 		return "", false
 	}
 
@@ -382,8 +339,7 @@ func (r *ClusterSwitchPolicyReconciler) decideSwitchover(
 		}
 	}
 
-	return fmt.Sprintf("automatic failover: local unhealthy for %d consecutive checks",
-		policy.Status.ConsecutiveLocalFailures), true
+	return decision.Reason, true
 }
 
 // executeSwitchover builds the engine config and invokes Execute.

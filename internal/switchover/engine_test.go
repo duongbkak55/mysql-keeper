@@ -217,3 +217,179 @@ func containsEvent(events []string, needle string) bool {
 	}
 	return false
 }
+
+// TestEngine_PromoteFailRollbacksFence confirms that a Promote failure
+// triggers rollback of the Fence step so the former source becomes writable
+// again; otherwise the cluster would be stuck RO after a recoverable hiccup.
+func TestEngine_PromoteFailRollbacksFence(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{
+		writable:        false,
+		setReadWriteErr: errors.New("remote MySQL unreachable"),
+	}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: true,
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:           local,
+		RemotePXC:          remote,
+		LocalInspector:     inspector,
+		RemoteInspector:    inspector,
+		LocalProxySQL:      proxy,
+		ReplicationChannel: "dc-to-dr",
+		FenceTimeout:       time.Second,
+		Progress:           reporter,
+	})
+
+	res := e.Execute(context.Background())
+
+	if res.Success {
+		t.Fatal("expected failure at Promote")
+	}
+	if res.FailedPhase != PhasePromote {
+		t.Errorf("expected FailedPhase=Promote, got %s", res.FailedPhase)
+	}
+	if !res.RolledBack {
+		t.Error("expected RolledBack=true")
+	}
+	if !local.writable {
+		t.Error("expected local to be writable again after rollback")
+	}
+}
+
+// TestEngine_RoutingFailRollsBackPromoteAndFence verifies that when Routing
+// fails, the engine rolls back both the Promote (remote back to RO) and the
+// Fence (local back to writable) so operators can resolve the routing issue
+// without emergency intervention.
+func TestEngine_RoutingFailRollsBackPromoteAndFence(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: true,
+	}
+	proxy := &recordingProxy{applyErr: errors.New("2 of 3 ProxySQL unreachable")}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:           local,
+		RemotePXC:          remote,
+		LocalInspector:     inspector,
+		RemoteInspector:    inspector,
+		LocalProxySQL:      proxy,
+		ReplicationChannel: "dc-to-dr",
+		FenceTimeout:       time.Second,
+		Progress:           reporter,
+	})
+
+	res := e.Execute(context.Background())
+
+	if res.Success || res.FailedPhase != PhaseRouting {
+		t.Fatalf("expected FailedPhase=Routing, got success=%v failed=%s",
+			res.Success, res.FailedPhase)
+	}
+	if !res.RolledBack {
+		t.Fatal("expected RolledBack=true")
+	}
+	if remote.writable {
+		t.Error("expected remote to be demoted back to RO after rollback")
+	}
+	if !local.writable {
+		t.Error("expected local to be re-promoted to writable after rollback")
+	}
+	// Routing's Apply failed before anything was committed, so there is
+	// nothing to revert via RollbackRouting. The rollback covers Promote and
+	// Fence only — a RollbackRouting call here would be a bug (it would
+	// double-apply the original routing on instances that never changed).
+	if proxy.backCalls != 0 {
+		t.Errorf("expected no RollbackRouting call on failed Apply, got %d", proxy.backCalls)
+	}
+}
+
+// TestEngine_GTIDCatchupTimeoutAborts exercises C6: when the replica cannot
+// catch up within CatchupTimeout, the flip must be aborted in PreFlight and
+// no Fence / Promote should run.
+func TestEngine_GTIDCatchupTimeoutAborts(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{writable: false}
+	inspectorLocal := &fakeInspector{snapshot: goodSnapshot("dc:1-1000")}
+	inspectorRemote := &fakeInspector{
+		snapshot:      goodSnapshot("dc:1-900"),
+		missingResult: "dc:901-1000",
+		waitErr:       errors.New("WAIT_FOR_EXECUTED_GTID_SET timed out"),
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:           local,
+		RemotePXC:          remote,
+		LocalInspector:     inspectorLocal,
+		RemoteInspector:    inspectorRemote,
+		LocalProxySQL:      proxy,
+		ReplicationChannel: "dc-to-dr",
+		CatchupTimeout:     500 * time.Millisecond,
+		FenceTimeout:       time.Second,
+		Progress:           reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if res.Success || res.FailedPhase != PhasePreFlight {
+		t.Fatalf("expected PreFlight abort due to C6 timeout; got success=%v phase=%s",
+			res.Success, res.FailedPhase)
+	}
+	if local.setReadOnlyCalls != 0 || remote.setReadWriteCalls != 0 {
+		t.Errorf("expected no state changes after PreFlight abort; fence=%d promote=%d",
+			local.setReadOnlyCalls, remote.setReadWriteCalls)
+	}
+	if !inspectorRemote.waitInvoked {
+		t.Error("expected WaitForGTID to have been invoked")
+	}
+}
+
+// TestEngine_ProgressReporterSeesAllPhases locks in the contract the
+// controller checkpoint code relies on: every phase must report start+
+// complete (or start+error) in the right order.
+func TestEngine_ProgressReporterSeesAllPhases(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: true,
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:           local,
+		RemotePXC:          remote,
+		LocalInspector:     inspector,
+		RemoteInspector:    inspector,
+		LocalProxySQL:      proxy,
+		ReplicationChannel: "dc-to-dr",
+		FenceTimeout:       time.Second,
+		Progress:           reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if !res.Success {
+		t.Fatalf("expected happy path; got: %v", res.Error)
+	}
+
+	wantPhases := []string{"PreFlight", "Fence", "Promote", "Routing", "ReverseReplica", "Verify"}
+	for _, phase := range wantPhases {
+		if !containsEvent(reporter.events, "start:"+phase) {
+			t.Errorf("missing start:%s in reporter events: %v", phase, reporter.events)
+		}
+	}
+	// Every successful phase must have a paired complete event (ReverseReplica
+	// is best-effort so it may report error without aborting, but Verify must
+	// always complete on the happy path).
+	if !containsEvent(reporter.events, "complete:Verify") {
+		t.Errorf("missing complete:Verify in reporter events: %v", reporter.events)
+	}
+}

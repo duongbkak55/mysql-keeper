@@ -198,7 +198,12 @@ func (m *Manager) blackholeOne(ctx context.Context, ep Endpoint, host string, po
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(m.timeout)
+	return m.runBlackholeSteps(ctx, db, host, port, hg)
+}
 
+// runBlackholeSteps executes the ping + UPDATE + INSERT + LOAD + SAVE on an
+// already-opened connection. Exported at package level for tests.
+func (m *Manager) runBlackholeSteps(ctx context.Context, db *sql.DB, host string, port, hg int32) error {
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
@@ -250,23 +255,30 @@ func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(m.timeout)
 
+	if err := m.runPrepareSteps(ctx, db, cfg); err != nil {
+		return db, err
+	}
+	return db, nil
+}
+
+// runPrepareSteps executes the ping + three DML statements of the prepare
+// phase on an already-opened connection. Exported at package level for tests.
+func (m *Manager) runPrepareSteps(ctx context.Context, db *sql.DB, cfg RoutingConfig) error {
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	if err := db.PingContext(qCtx); err != nil {
-		return db, fmt.Errorf("ping: %w", err)
+		return fmt.Errorf("ping: %w", err)
 	}
 
-	// Step 1: Demote old writer in the staged mysql_servers table.
 	if _, err := db.ExecContext(qCtx, `
 		UPDATE mysql_servers
 		SET hostgroup_id = ?, max_connections = 0
 		WHERE hostname = ? AND port = ?
 	`, cfg.ReadOnlyHostgroup, cfg.OldWriterHost, cfg.OldWriterPort); err != nil {
-		return db, fmt.Errorf("demote old writer: %w", err)
+		return fmt.Errorf("demote old writer: %w", err)
 	}
 
-	// Step 2: Stage the new writer in the write HG.
 	if _, err := db.ExecContext(qCtx, `
 		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
@@ -276,10 +288,9 @@ func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig
 			max_connections = 1000,
 			weight          = 1
 	`, cfg.ReadWriteHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
-		return db, fmt.Errorf("promote new writer: %w", err)
+		return fmt.Errorf("promote new writer: %w", err)
 	}
 
-	// Step 3: Also put the new writer in the read HG for SELECT traffic.
 	if _, err := db.ExecContext(qCtx, `
 		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
@@ -287,9 +298,9 @@ func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig
 			status          = 'ONLINE',
 			max_connections = 1000
 	`, cfg.ReadOnlyHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
-		return db, fmt.Errorf("add new writer to RO group: %w", err)
+		return fmt.Errorf("add new writer to RO group: %w", err)
 	}
-	return db, nil
+	return nil
 }
 
 // commitOne runs LOAD + SAVE on an already-prepared connection.
