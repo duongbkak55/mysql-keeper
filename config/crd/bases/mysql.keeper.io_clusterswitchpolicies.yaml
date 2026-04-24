@@ -270,11 +270,24 @@ spec:
                 description: ProxySQL lists the local ProxySQL admin endpoints (typically
                   3 instances).
                 items:
-                  description: ProxySQLEndpoint defines a single ProxySQL admin interface.
+                  description: |-
+                    ProxySQLEndpoint defines a single ProxySQL admin interface.
+
+
+                    The controller talks to ProxySQL on its admin port (default 6032) to:
+                      - health-check the instance (SELECT 1)
+                      - rewrite hostgroup routing during a switchover (UPDATE mysql_servers
+                      - apply the blackhole fence when the SQL fence cannot complete
+                        (OFFLINE_HARD + max_connections=0 on the target writer)
+
+
+                    The admin port is separate from the client port that applications use
+                    (default 6033) — do not confuse the two in Service definitions.
                   properties:
                     adminPort:
                       default: 6032
                       description: AdminPort is the ProxySQL admin interface port.
+                        Default 6032.
                       format: int32
                       type: integer
                     credentialsSecretRef:
@@ -295,7 +308,6 @@ spec:
                       description: Host is the DNS name or IP of the ProxySQL instance.
                       type: string
                   required:
-                  - adminPort
                   - credentialsSecretRef
                   - host
                   type: object

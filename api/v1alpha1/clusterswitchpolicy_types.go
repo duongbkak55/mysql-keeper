@@ -199,13 +199,24 @@ type MySQLEndpointConfig struct {
 }
 
 // ProxySQLEndpoint defines a single ProxySQL admin interface.
+//
+// The controller talks to ProxySQL on its admin port (default 6032) to:
+//   - health-check the instance (SELECT 1)
+//   - rewrite hostgroup routing during a switchover (UPDATE mysql_servers
+//     + LOAD MYSQL SERVERS TO RUNTIME + SAVE MYSQL SERVERS TO DISK)
+//   - apply the blackhole fence when the SQL fence cannot complete
+//     (OFFLINE_HARD + max_connections=0 on the target writer)
+//
+// The admin port is separate from the client port that applications use
+// (default 6033) — do not confuse the two in Service definitions.
 type ProxySQLEndpoint struct {
 	// Host is the DNS name or IP of the ProxySQL instance.
 	Host string `json:"host"`
 
-	// AdminPort is the ProxySQL admin interface port.
+	// AdminPort is the ProxySQL admin interface port. Default 6032.
 	// +kubebuilder:default=6032
-	AdminPort int32 `json:"adminPort"`
+	// +optional
+	AdminPort int32 `json:"adminPort,omitempty"`
 
 	// CredentialsSecretRef refers to a Secret with "username" and "password" for ProxySQL admin.
 	CredentialsSecretRef SecretRef `json:"credentialsSecretRef"`
