@@ -6,6 +6,7 @@
 | Both clusters writable at the same time            | [split-brain-recovery.md](split-brain-recovery.md) | critical (page)  |
 | Planned DR drill (quarterly / post-upgrade)        | [dr-drill.md](dr-drill.md)                      | informational    |
 | Chaos drills (D1–D5) on staging                    | [chaos-drills.md](chaos-drills.md)              | informational    |
+| Go-live DR drill plan (master checklist)           | [go-live-drill-plan.md](go-live-drill-plan.md)  | release gate     |
 
 ## When to disable `autoFailover`
 
