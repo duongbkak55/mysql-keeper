@@ -411,18 +411,29 @@ type PreFlightConfig struct {
 }
 
 // ClusterHealthStatus holds the observed health of one cluster.
+//
+// Every field here is optional at the CRD level because status is populated
+// progressively by the controller — on a freshly-created CR the status
+// subresource starts empty, and partial patches land as the various health
+// probes complete at different times. Marking the bool fields required
+// would reject every transitional state (e.g., "we have a measurement of
+// `healthy` but not yet of `isWritable`") with an admission error rather
+// than allowing the next reconcile to fill it in.
 type ClusterHealthStatus struct {
 	// Healthy is the aggregated health determination.
-	Healthy bool `json:"healthy"`
+	// +optional
+	Healthy bool `json:"healthy,omitempty"`
 
 	// PXCState is the state from the PerconaXtraDBCluster CRD (e.g. "ready", "error").
 	// +optional
 	PXCState string `json:"pxcState,omitempty"`
 
 	// PXCReadyNodes is the number of PXC pod members currently ready.
+	// +optional
 	PXCReadyNodes int32 `json:"pxcReadyNodes,omitempty"`
 
 	// WsrepClusterSize is the reported Galera cluster size.
+	// +optional
 	WsrepClusterSize int32 `json:"wsrepClusterSize,omitempty"`
 
 	// WsrepClusterStatus is the reported Galera status string (e.g. "Primary").
@@ -430,9 +441,11 @@ type ClusterHealthStatus struct {
 	WsrepClusterStatus string `json:"wsrepClusterStatus,omitempty"`
 
 	// IsWritable reports whether the cluster currently has read_only=OFF.
-	IsWritable bool `json:"isWritable"`
+	// +optional
+	IsWritable bool `json:"isWritable,omitempty"`
 
 	// ProxySQLHealthy is the number of local ProxySQL instances that responded.
+	// +optional
 	ProxySQLHealthy int32 `json:"proxySQLHealthy,omitempty"`
 
 	// LastChecked is when this health snapshot was collected.

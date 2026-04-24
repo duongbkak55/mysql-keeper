@@ -669,9 +669,6 @@ spec:
                     description: WsrepClusterStatus is the reported Galera status
                       string (e.g. "Primary").
                     type: string
-                required:
-                - healthy
-                - isWritable
                 type: object
               observedGeneration:
                 description: ObservedGeneration is the last spec generation the controller
@@ -728,9 +725,6 @@ spec:
                     description: WsrepClusterStatus is the reported Galera status
                       string (e.g. "Primary").
                     type: string
-                required:
-                - healthy
-                - isWritable
                 type: object
               switchoverProgress:
                 description: |-
