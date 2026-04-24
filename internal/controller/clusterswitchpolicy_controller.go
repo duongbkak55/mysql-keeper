@@ -689,7 +689,11 @@ func (r *ClusterSwitchPolicyReconciler) buildComponents(
 	if err != nil {
 		return nil, fmt.Errorf("local MySQL credentials: %w", err)
 	}
-	localDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/",
+	// parseTime=true is required so go-sql-driver returns DATETIME columns
+	// as time.Time. Without it, Scan into *time.Time (keeper.leader.
+	// acquired_at, heartbeat_at) fails with "Scan error on column index N,
+	// ... []uint8 into type *time.Time" at runtime.
+	localDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&loc=Local",
 		localUser, localPass,
 		policy.Spec.LocalMySQL.Host, policy.Spec.LocalMySQL.Port,
 	)
@@ -698,7 +702,7 @@ func (r *ClusterSwitchPolicyReconciler) buildComponents(
 	if err != nil {
 		return nil, fmt.Errorf("remote MySQL credentials: %w", err)
 	}
-	remoteDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/",
+	remoteDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&loc=Local",
 		remoteUser, remotePass,
 		policy.Spec.RemoteMySQL.Host, policy.Spec.RemoteMySQL.Port,
 	)
