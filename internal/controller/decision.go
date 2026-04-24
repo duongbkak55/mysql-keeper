@@ -68,12 +68,28 @@ func EvaluateSwitchover(
 			Reason: "autoFailover disabled and no manual trigger set",
 		}
 	}
-	if policy.Status.ConsecutiveLocalFailures < policy.Spec.HealthCheck.FailureThreshold {
+	// Failover triggers on EITHER counter hitting the threshold:
+	//   - ConsecutiveLocalFailures: MySQL reachable but reporting bad state
+	//     (wsrep non-Primary, quorum lost, etc.)
+	//   - ConsecutiveLocalUnreachable: can't even reach MySQL (pod down,
+	//     network cut, TCP refused)
+	//
+	// Tracking them separately lets operators alert on the specific failure
+	// mode, but either condition sustained past the threshold is worth a
+	// failover. The previous design only looked at Failures, so a hard-down
+	// local cluster (MySQL crashed / container killed) never tripped the
+	// threshold — reported by users as "I killed local, state Unknown, but
+	// switchover never fires."
+	threshold := policy.Spec.HealthCheck.FailureThreshold
+	failures := policy.Status.ConsecutiveLocalFailures
+	unreach := policy.Status.ConsecutiveLocalUnreachable
+	if failures < threshold && unreach < threshold {
 		return SwitchoverDecision{
 			Should: false,
-			Reason: fmt.Sprintf("ConsecutiveLocalFailures=%d < threshold=%d",
-				policy.Status.ConsecutiveLocalFailures,
-				policy.Spec.HealthCheck.FailureThreshold),
+			Reason: fmt.Sprintf(
+				"local ok: failures=%d unreachable=%d (threshold=%d on both)",
+				failures, unreach, threshold,
+			),
 		}
 	}
 
@@ -107,9 +123,18 @@ func EvaluateSwitchover(
 		}
 	}
 
+	trigger := "unhealthy"
+	worst := failures
+	if unreach >= threshold && failures < threshold {
+		trigger = "unreachable"
+		worst = unreach
+	} else if unreach > failures {
+		worst = unreach
+	}
 	return SwitchoverDecision{
 		Should: true,
-		Reason: fmt.Sprintf("automatic failover: local unhealthy for %d consecutive checks",
-			policy.Status.ConsecutiveLocalFailures),
+		Reason: fmt.Sprintf("automatic failover: local %s for %d consecutive checks (failures=%d unreachable=%d threshold=%d)",
+			trigger, worst, failures, unreach, threshold,
+		),
 	}
 }

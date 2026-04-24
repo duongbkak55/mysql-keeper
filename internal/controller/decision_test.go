@@ -110,6 +110,40 @@ func TestDecide_HappyPathAutoFailover(t *testing.T) {
 	}
 }
 
+// TestDecide_UnreachableOnlyAlsoTriggers covers the regression where
+// killing local MySQL entirely (not "PXC up but reporting bad state")
+// never crossed the failover threshold because ConsecutiveLocalFailures
+// stayed at 0 while ConsecutiveLocalUnreachable grew unbounded.
+func TestDecide_UnreachableOnlyAlsoTriggers(t *testing.T) {
+	p := newPolicy()
+	p.Status.ConsecutiveLocalFailures = 0      // local never reported "unhealthy"
+	p.Status.ConsecutiveLocalUnreachable = 5   // only "can't reach" accumulated
+
+	d := EvaluateSwitchover(p,
+		health.ClusterHealth{Writable: health.WritableUnknown, Healthy: false,
+			Message: "dial tcp: connection refused"},
+		health.ClusterHealth{Writable: health.WritableNo, Healthy: true},
+		time.Now(),
+	)
+	if !d.Should {
+		t.Fatalf("expected failover on sustained unreachable; got: %s", d.Reason)
+	}
+	if !containsString(d.Reason, "unreachable") {
+		t.Errorf("expected reason to mention 'unreachable'; got: %s", d.Reason)
+	}
+}
+
+// containsString is a tiny helper — package already imports strings? Check
+// import list first; if not we inline a loop.
+func containsString(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
 // TestDecide_AutoFailoverDisabled — respects the kill switch.
 func TestDecide_AutoFailoverDisabled(t *testing.T) {
 	p := newPolicy()
