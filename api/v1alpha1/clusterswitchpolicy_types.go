@@ -34,10 +34,35 @@ type ClusterSwitchPolicySpec struct {
 	// PXCName is the name of the local PerconaXtraDBCluster resource.
 	PXCName string `json:"pxcName"`
 
-	// ReplicationChannelName is the name of the replication channel in spec.replication.channels[]
-	// that this controller toggles (isSource=true/false) to control the cluster's writer role.
-	// Must match the channel name configured in the PerconaXtraDBCluster CRD on both sites.
+	// ReplicationChannelName is the name of the channel that terminates ON
+	// THIS cluster when this cluster is acting as a replica. It is the
+	// channel the controller will STOP + RESET when this cluster becomes
+	// the new source during a flip, and the channel the controller will
+	// (re)activate when this cluster is demoted back to replica.
+	//
+	// For symmetric setups (same channel name both directions) this field
+	// alone is enough; leave PeerReplicationChannelName unset and the
+	// controller will use this value for both sides.
+	//
+	// Must match the channel name configured in the PerconaXtraDBCluster
+	// CRD on both sites.
 	ReplicationChannelName string `json:"replicationChannelName"`
+
+	// PeerReplicationChannelName is the name of the channel that
+	// terminates ON THE PEER cluster when the peer is acting as a replica.
+	// Set this when DC→DR and DR→DC use different channel names
+	// (e.g. "dc-to-dr" inbound on DR vs "dr-to-dc" inbound on DC).
+	//
+	// Empty means "same as ReplicationChannelName" — the symmetric case.
+	//
+	// Which channel the controller uses at each step:
+	//   - PreFlight C3 (is remote replica healthy?) → PeerReplicationChannelName
+	//   - Promote (STOP+RESET on new source, which was the remote replica)
+	//     → PeerReplicationChannelName
+	//   - ReverseReplica (STOP on former source, which is now the local
+	//     cluster preparing to replicate back) → ReplicationChannelName
+	// +optional
+	PeerReplicationChannelName string `json:"peerReplicationChannelName,omitempty"`
 
 	// LocalMySQL lists direct MySQL endpoints for the local PXC cluster nodes.
 	// Used for health checks and read_only toggle on the local cluster.

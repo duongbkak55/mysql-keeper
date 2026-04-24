@@ -13,10 +13,20 @@ spec:
   pxcNamespace: percona-xtradb
   pxcName: pxc-dc
 
-  # The replication channel name in spec.replication.channels[].name of the PerconaXtraDBCluster CRD.
-  # mysql-keeper toggles isSource on this channel to promote/demote this cluster.
-  # Must match the channel name configured on both DC and DR sides.
+  # Channel that terminates on THIS cluster when this cluster is a replica.
+  # For the DC CR this is the channel DC will run after a flip (when DC is
+  # demoted to replica of DR). In a symmetric setup leave peerReplicationChannelName
+  # unset and both sides use the same name.
   replicationChannelName: dc-to-dr
+
+  # Optional — set only when DC→DR and DR→DC use different channel names.
+  # peerReplicationChannelName is the channel on the PEER cluster (here DR)
+  # when peer is acting as replica (pre-flip baseline). Preflight C3 and
+  # post-promote STOP+RESET target this channel.
+  # Example asymmetric setup:
+  #   replicationChannelName:     dr-to-dc     # DC's inbound channel
+  #   peerReplicationChannelName: dc-to-dr     # DR's inbound channel
+  # peerReplicationChannelName: ""
 
   # MySQL endpoint for the LOCAL DC PXC cluster.
   # The controller reads health status and toggles read_only via this endpoint.

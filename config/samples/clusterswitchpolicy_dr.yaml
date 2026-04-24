@@ -13,9 +13,16 @@ spec:
   pxcNamespace: percona-xtradb
   pxcName: pxc-dr
 
-  # The replication channel name in spec.replication.channels[].name of the PerconaXtraDBCluster CRD.
-  # Must match the channel name configured on both DC and DR sides.
+  # Channel that terminates on THIS cluster when DR is a replica — i.e.,
+  # the baseline direction DC→DR. In a symmetric setup both CRs share the
+  # same value; for asymmetric channels add peerReplicationChannelName.
   replicationChannelName: dc-to-dr
+
+  # Optional asymmetric override — see the DC sample for semantics.
+  # Example: DR CR with different inbound/outbound names:
+  #   replicationChannelName:     dc-to-dr     # DR's inbound (active now)
+  #   peerReplicationChannelName: dr-to-dc     # DC's inbound after flip
+  # peerReplicationChannelName: ""
 
   # MySQL endpoint for the LOCAL DR PXC cluster.
   localMySQL:

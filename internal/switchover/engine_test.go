@@ -86,7 +86,7 @@ func TestEngine_FenceFailsWhenLocalReachable(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})
@@ -127,7 +127,7 @@ func TestEngine_FenceEscalatesToBlackholeWhenLocalUnreachable(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})
@@ -160,7 +160,7 @@ func TestEngine_PreFlightFailShortCircuits(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})
@@ -240,7 +240,7 @@ func TestEngine_PromoteFailRollbacksFence(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})
@@ -281,7 +281,7 @@ func TestEngine_RoutingFailRollsBackPromoteAndFence(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})
@@ -331,7 +331,7 @@ func TestEngine_GTIDCatchupTimeoutAborts(t *testing.T) {
 		LocalInspector:     inspectorLocal,
 		RemoteInspector:    inspectorRemote,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		CatchupTimeout:     500 * time.Millisecond,
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
@@ -370,7 +370,7 @@ func TestEngine_ProgressReporterSeesAllPhases(t *testing.T) {
 		LocalInspector:     inspector,
 		RemoteInspector:    inspector,
 		LocalProxySQL:      proxy,
-		ReplicationChannel: "dc-to-dr",
+		LocalReplicationChannel: "dc-to-dr",
 		FenceTimeout:       time.Second,
 		Progress:           reporter,
 	})

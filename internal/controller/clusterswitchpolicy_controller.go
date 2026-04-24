@@ -357,15 +357,25 @@ func (r *ClusterSwitchPolicyReconciler) executeSwitchover(
 		attemptID, reason,
 	)
 
+	// Resolve the two channel names. For symmetric setups (same name both
+	// directions), PeerReplicationChannelName is empty and we reuse the
+	// primary name.
+	localChannel := policy.Spec.ReplicationChannelName
+	remoteChannel := policy.Spec.PeerReplicationChannelName
+	if remoteChannel == "" {
+		remoteChannel = localChannel
+	}
+
 	engine := switchover.NewEngine(switchover.Config{
-		LocalPXC:           comps.localPXC,
-		RemotePXC:          comps.remotePXC,
-		LocalInspector:     comps.localInspector,
-		RemoteInspector:    comps.remoteInspector,
-		LocalReplication:   comps.localReplication,
-		RemoteReplication:  comps.remoteReplication,
-		LocalProxySQL:      comps.proxySQLMgr,
-		ReplicationChannel: policy.Spec.ReplicationChannelName,
+		LocalPXC:                 comps.localPXC,
+		RemotePXC:                comps.remotePXC,
+		LocalInspector:           comps.localInspector,
+		RemoteInspector:          comps.remoteInspector,
+		LocalReplication:         comps.localReplication,
+		RemoteReplication:        comps.remoteReplication,
+		LocalProxySQL:            comps.proxySQLMgr,
+		LocalReplicationChannel:  localChannel,
+		RemoteReplicationChannel: remoteChannel,
 		Routing: proxysql.RoutingConfig{
 			OldWriterHost:      sw.LocalWriterHost,
 			OldWriterPort:      3306,

@@ -22,21 +22,24 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationMetrics(
 	policy *mysqlv1alpha1.ClusterSwitchPolicy,
 	comps *componentSet,
 ) {
-	channel := policy.Spec.ReplicationChannelName
-	if channel == "" {
+	localChannel := policy.Spec.ReplicationChannelName
+	remoteChannel := policy.Spec.PeerReplicationChannelName
+	if remoteChannel == "" {
+		remoteChannel = localChannel
+	}
+	if localChannel == "" {
 		return
 	}
 	role := policy.Spec.ClusterRole
 
-	observe := func(inspector switchover.ReplicationInspector, scope string) {
+	observe := func(inspector switchover.ReplicationInspector, scope, channel string) {
 		if inspector == nil {
 			return
 		}
 		status, err := inspector.GetReplicationStatus(ctx, channel)
 		if err != nil || !status.ConfigExists {
-			// Absence of a configured row is legitimate on the DC when DC is
-			// the source. Record 0 so the gauge still has a data point rather
-			// than leaving a hole.
+			// Absence of a configured row is legitimate on the source side.
+			// Record 0 so the gauge still has a data point rather than a hole.
 			metrics.ReplicationChannelIORunning.WithLabelValues(role, scope, channel).Set(0)
 			metrics.ReplicationChannelSQLRunning.WithLabelValues(role, scope, channel).Set(0)
 			return
@@ -52,8 +55,6 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationMetrics(
 		metrics.ReplicationChannelIORunning.WithLabelValues(role, scope, channel).Set(ioVal)
 		metrics.ReplicationChannelSQLRunning.WithLabelValues(role, scope, channel).Set(sqlVal)
 
-		// Binlog retention is a cheap side-query — keep it on the same path
-		// so a single bad network round-trip doesn't split the picture.
 		snap, err := inspector.GetGTIDSnapshot(ctx)
 		if err == nil {
 			metrics.BinlogExpireLogsSeconds.WithLabelValues(role, scope).Set(
@@ -61,6 +62,6 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationMetrics(
 		}
 	}
 
-	observe(comps.localInspector, "local")
-	observe(comps.remoteInspector, "remote")
+	observe(comps.localInspector, "local", localChannel)
+	observe(comps.remoteInspector, "remote", remoteChannel)
 }

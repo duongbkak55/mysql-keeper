@@ -150,8 +150,22 @@ type Config struct {
 	// fully unreachable, this moves writes away from it unconditionally.
 	BlackholeFence proxysql.BlackholeConfig
 
-	// ReplicationChannel is the channel name on both clusters. Required.
-	ReplicationChannel string
+	// LocalReplicationChannel is the channel name on the LOCAL cluster when
+	// local is acting as a replica (after a flip, when former-source
+	// becomes replica of the new source). Used by phaseReverseReplica when
+	// stopping any stale inbound channel on the former source.
+	// Required.
+	LocalReplicationChannel string
+
+	// RemoteReplicationChannel is the channel name on the REMOTE cluster
+	// when remote is acting as a replica — which is the pre-flip baseline.
+	// Used by preflight C3 (health check against remote's replication
+	// threads) and by phasePromote (STOP+RESET on remote once it becomes
+	// the new source).
+	// If both directions use the same channel name, set this to the same
+	// value as LocalReplicationChannel.
+	// Required.
+	RemoteReplicationChannel string
 
 	// ReverseReplicationSource tells the former source how to connect back to
 	// the new source for replication. Optional — when unset, reverse-replica
@@ -234,7 +248,8 @@ func (e *Engine) Execute(ctx context.Context) Result {
 		"event", "switchover",
 		"reason", e.cfg.Reason,
 		"attemptID", e.cfg.AttemptID,
-		"channel", e.cfg.ReplicationChannel,
+		"localChannel", e.cfg.LocalReplicationChannel,
+		"remoteChannel", e.cfg.RemoteReplicationChannel,
 	)
 	start := time.Now()
 	logger.Info("switchover started")
@@ -339,7 +354,7 @@ func (e *Engine) phasePreFlight(ctx context.Context) (*PreFlightResult, error) {
 		RemotePXC:                e.cfg.RemotePXC,
 		LocalInspector:           e.cfg.LocalInspector,
 		RemoteInspector:          e.cfg.RemoteInspector,
-		Channel:                  e.cfg.ReplicationChannel,
+		Channel:                  e.cfg.RemoteReplicationChannel,
 		CatchupTimeout:           e.cfg.CatchupTimeout,
 		MinBinlogRetentionSecond: e.cfg.MinBinlogRetentionSeconds,
 		AllowDataLossFailover:    e.cfg.AllowDataLossFailover,
@@ -409,14 +424,17 @@ func (e *Engine) phasePromote(ctx context.Context) error {
 		return fmt.Errorf("set remote read_only=OFF: %w", err)
 	}
 
-	if e.cfg.RemoteReplication != nil && e.cfg.ReplicationChannel != "" {
-		if err := e.cfg.RemoteReplication.StopReplica(ctx, e.cfg.ReplicationChannel); err != nil {
+	// Remote was the replica before the flip. Its inbound channel name is
+	// RemoteReplicationChannel. Stop + reset so the new source does not
+	// fight its own former upstream.
+	if e.cfg.RemoteReplication != nil && e.cfg.RemoteReplicationChannel != "" {
+		if err := e.cfg.RemoteReplication.StopReplica(ctx, e.cfg.RemoteReplicationChannel); err != nil {
 			logger.Error(err, "STOP REPLICA on new source failed — investigate",
-				"channel", e.cfg.ReplicationChannel)
+				"channel", e.cfg.RemoteReplicationChannel)
 		}
-		if err := e.cfg.RemoteReplication.ResetReplicaAll(ctx, e.cfg.ReplicationChannel); err != nil {
+		if err := e.cfg.RemoteReplication.ResetReplicaAll(ctx, e.cfg.RemoteReplicationChannel); err != nil {
 			logger.Error(err, "RESET REPLICA ALL on new source failed — investigate",
-				"channel", e.cfg.ReplicationChannel)
+				"channel", e.cfg.RemoteReplicationChannel)
 		}
 	}
 	return nil
@@ -443,10 +461,14 @@ func (e *Engine) phaseReverseReplica(ctx context.Context) error {
 	// fight the operator's reconcile of replicationChannels[].sourcesList.
 	// Full CHANGE REPLICATION SOURCE is applied through the PXC operator by
 	// the controller updating spec.replication.channels[].sourcesList.
-	if err := e.cfg.LocalReplication.StopReplica(ctx, e.cfg.ReplicationChannel); err != nil {
+	// Local becomes replica of the new source. The channel that will run
+	// on local is LocalReplicationChannel. STOP + RESET any stale state
+	// on that channel so the PXC operator's next reconcile of
+	// spec.replication.channels[].sourcesList takes effect cleanly.
+	if err := e.cfg.LocalReplication.StopReplica(ctx, e.cfg.LocalReplicationChannel); err != nil {
 		return fmt.Errorf("stop former-source replication channel: %w", err)
 	}
-	if err := e.cfg.LocalReplication.ResetReplicaAll(ctx, e.cfg.ReplicationChannel); err != nil {
+	if err := e.cfg.LocalReplication.ResetReplicaAll(ctx, e.cfg.LocalReplicationChannel); err != nil {
 		return fmt.Errorf("reset former-source replication channel: %w", err)
 	}
 	return nil
