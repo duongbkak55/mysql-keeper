@@ -25,6 +25,11 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
 
+  # Pods — list ProxySQL pods dynamically when proxySQLSelector is configured.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
   # Events — publish controller events.
   - apiGroups: [""]
     resources: ["events"]

@@ -1,0 +1,52 @@
+#
+# ProxySQL config for the local DC staging front-end.
+#
+# Two admin users — "admin" stays locked to localhost, "keeper" is the
+# account the controller / switchover-cli uses from across the compose
+# network. This matches the pattern docs/local-pxc-bug-repro.md
+# recommends for production.
+#
+# Writer hostgroup 10 — DC PXC (read_only=OFF)
+# Reader hostgroup 20 — same DC PXC but routed for SELECTs
+# Blackhole hostgroup 9999 — unrouted, used by mysql-keeper fence
+#
+datadir="/var/lib/proxysql"
+
+admin_variables =
+{
+    admin_credentials = "admin:stagingpass;keeper:stagingpass"
+    mysql_ifaces = "0.0.0.0:6032"
+    refresh_interval = 2000
+}
+
+mysql_variables =
+{
+    threads = 2
+    max_connections = 512
+    default_query_timeout = 10000
+    server_version = "8.0.35"
+    interfaces = "0.0.0.0:6033"
+    monitor_username = "monitor"
+    monitor_password = "stagingpass"
+    monitor_connect_interval = 60000
+    monitor_ping_interval = 10000
+    monitor_read_only_interval = 3000
+    monitor_read_only_timeout = 2500
+}
+
+mysql_servers =
+(
+    { hostgroup = 10, hostname = "pxc-dc", port = 3306, max_connections = 200, weight = 1000, status = "ONLINE" },
+    { hostgroup = 20, hostname = "pxc-dc", port = 3306, max_connections = 200, weight = 1000, status = "ONLINE" }
+)
+
+mysql_users =
+(
+    { username = "root", password = "stagingpass", default_hostgroup = 10, active = 1, transaction_persistent = 1 }
+)
+
+mysql_query_rules =
+(
+    { rule_id = 1, active = 1, match_pattern = "^SELECT .* FOR UPDATE", destination_hostgroup = 10, apply = 1 },
+    { rule_id = 2, active = 1, match_pattern = "^SELECT", destination_hostgroup = 20, apply = 1 }
+)

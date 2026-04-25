@@ -47,23 +47,38 @@ spec:
       name: pxc-dr-admin-creds
       namespace: mysql-keeper-system
 
-  # Local DC ProxySQL admin endpoints (3 instances).
-  proxySQL:
-    - host: proxysql-0.proxysql-dc.percona-xtradb.svc.cluster.local
-      adminPort: 6032
-      credentialsSecretRef:
-        name: proxysql-dc-admin-creds
-        namespace: mysql-keeper-system
-    - host: proxysql-1.proxysql-dc.percona-xtradb.svc.cluster.local
-      adminPort: 6032
-      credentialsSecretRef:
-        name: proxysql-dc-admin-creds
-        namespace: mysql-keeper-system
-    - host: proxysql-2.proxysql-dc.percona-xtradb.svc.cluster.local
-      adminPort: 6032
-      credentialsSecretRef:
-        name: proxysql-dc-admin-creds
-        namespace: mysql-keeper-system
+  # ProxySQL admin endpoints — choose ONE of the two options below.
+
+  # Option A: dynamic discovery (recommended for Deployment-based ProxySQL).
+  # The controller lists pods matching the label selector at every reconcile,
+  # so endpoints are always current after pod restarts or IP changes.
+  proxySQLSelector:
+    namespace: percona-xtradb
+    matchLabels:
+      app: proxysql
+      site: dc
+    adminPort: 6032
+    credentialsSecretRef:
+      name: proxysql-dc-admin-creds
+      namespace: mysql-keeper-system
+
+  # Option B: static list (for StatefulSet-based ProxySQL with stable DNS names).
+  # proxySQL:
+  #   - host: proxysql-0.proxysql-dc.percona-xtradb.svc.cluster.local
+  #     adminPort: 6032
+  #     credentialsSecretRef:
+  #       name: proxysql-dc-admin-creds
+  #       namespace: mysql-keeper-system
+  #   - host: proxysql-1.proxysql-dc.percona-xtradb.svc.cluster.local
+  #     adminPort: 6032
+  #     credentialsSecretRef:
+  #       name: proxysql-dc-admin-creds
+  #       namespace: mysql-keeper-system
+  #   - host: proxysql-2.proxysql-dc.percona-xtradb.svc.cluster.local
+  #     adminPort: 6032
+  #     credentialsSecretRef:
+  #       name: proxysql-dc-admin-creds
+  #       namespace: mysql-keeper-system
 
   healthCheck:
     interval: 15s              # Run health checks every 15 seconds.

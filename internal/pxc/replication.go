@@ -196,6 +196,64 @@ func (m *Manager) ProbeReachable(ctx context.Context, budget time.Duration) (boo
 	return one == 1, nil
 }
 
+// GetReplicationLagSeconds returns how many seconds the replica is behind the
+// source, derived from the ORIGINAL_COMMIT_TIMESTAMP of the last applied (or
+// last queued) transaction on this node's replication channel.
+// Returns -1 when no data is available: channel not configured, no transactions
+// replicated yet, or a NULL timestamp. Clamps negative values to 0 (clock skew).
+func (m *Manager) GetReplicationLagSeconds(ctx context.Context, channel string) (int64, error) {
+	if channel == "" {
+		return -1, fmt.Errorf("channel name is empty")
+	}
+	db, err := m.openDB(ctx)
+	if err != nil {
+		return -1, err
+	}
+	defer db.Close()
+
+	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+
+	// Prefer coordinator's LAST_APPLIED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP
+	// (available on both MTS and single-threaded replicas via the coordinator
+	// table). Fall back to the queued timestamp when the coordinator row is absent.
+	var lag sql.NullInt64
+	err = db.QueryRowContext(qCtx, `
+		SELECT TIMESTAMPDIFF(SECOND,
+			COALESCE(
+				NULLIF(ac.LAST_APPLIED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP, '0000-00-00 00:00:00.000000'),
+				NULLIF(cs.LAST_QUEUED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP,  '0000-00-00 00:00:00.000000')
+			),
+			NOW())
+		FROM performance_schema.replication_connection_status cs
+		LEFT JOIN performance_schema.replication_applier_status_by_coordinator ac
+		  ON ac.CHANNEL_NAME = cs.CHANNEL_NAME
+		WHERE cs.CHANNEL_NAME = ?`, channel,
+	).Scan(&lag)
+
+	if err != nil && err != sql.ErrNoRows {
+		// Older schema or PS disabled — fall back to connection_status only.
+		err = db.QueryRowContext(qCtx, `
+			SELECT TIMESTAMPDIFF(SECOND,
+				NULLIF(LAST_QUEUED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP, '0000-00-00 00:00:00.000000'),
+				NOW())
+			FROM performance_schema.replication_connection_status
+			WHERE CHANNEL_NAME = ?`, channel,
+		).Scan(&lag)
+	}
+
+	switch {
+	case err == sql.ErrNoRows, !lag.Valid:
+		return -1, nil
+	case err != nil:
+		return -1, fmt.Errorf("get replication lag seconds: %w", err)
+	}
+	if lag.Int64 < 0 {
+		return 0, nil
+	}
+	return lag.Int64, nil
+}
+
 // quoteChannel embeds a channel name as a single-quoted SQL string literal.
 // FOR CHANNEL takes a string literal (not an identifier), so we escape single
 // quotes and backslashes rather than using backticks. Channel names in PXC

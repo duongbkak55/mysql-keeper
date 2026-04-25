@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,10 @@ func (p *recordingProxy) Blackhole(context.Context, proxysql.BlackholeConfig) er
 	return p.blackholeErr
 }
 
+func (p *recordingProxy) ApplyCalls() int     { p.mu.Lock(); defer p.mu.Unlock(); return p.applyCalls }
+func (p *recordingProxy) BackCalls() int      { p.mu.Lock(); defer p.mu.Unlock(); return p.backCalls }
+func (p *recordingProxy) BlackholeCalls() int { p.mu.Lock(); defer p.mu.Unlock(); return p.blackholeCalls }
+
 // recordingReporter captures phase callbacks so tests can assert the exact
 // sequence the engine drove.
 type recordingReporter struct {
@@ -61,6 +66,14 @@ func (r *recordingReporter) OnPhaseError(_ context.Context, phase Phase, _ error
 	r.mu.Lock()
 	r.events = append(r.events, "error:"+phase.String())
 	r.mu.Unlock()
+}
+
+func (r *recordingReporter) Events() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.events))
+	copy(out, r.events)
+	return out
 }
 
 // TestEngine_FenceFailsWhenLocalReachable is the key invariant: if the SQL
@@ -98,11 +111,11 @@ func TestEngine_FenceFailsWhenLocalReachable(t *testing.T) {
 	if res.FailedPhase != PhaseFence {
 		t.Errorf("expected FailedPhase=Fence, got %s", res.FailedPhase)
 	}
-	if proxy.blackholeCalls != 0 {
-		t.Errorf("expected Blackhole NOT to be called when local is reachable; calls=%d", proxy.blackholeCalls)
+	if proxy.BlackholeCalls() != 0 {
+		t.Errorf("expected Blackhole NOT to be called when local is reachable; calls=%d", proxy.BlackholeCalls())
 	}
-	if !containsEvent(reporter.events, "error:Fence") {
-		t.Errorf("expected error:Fence event; got %v", reporter.events)
+	if !containsEvent(reporter.Events(), "error:Fence") {
+		t.Errorf("expected error:Fence event; got %v", reporter.Events())
 	}
 }
 
@@ -137,7 +150,7 @@ func TestEngine_FenceEscalatesToBlackholeWhenLocalUnreachable(t *testing.T) {
 		t.Fatalf("expected engine to succeed via blackhole fallback; err=%v failedPhase=%s",
 			res.Error, res.FailedPhase)
 	}
-	if proxy.blackholeCalls == 0 {
+	if proxy.BlackholeCalls() == 0 {
 		t.Errorf("expected Blackhole fence to be invoked")
 	}
 }
@@ -169,11 +182,11 @@ func TestEngine_PreFlightFailShortCircuits(t *testing.T) {
 	if res.Success || res.FailedPhase != PhasePreFlight {
 		t.Fatalf("expected PreFlight failure; got success=%v failed=%s", res.Success, res.FailedPhase)
 	}
-	if local.setReadOnlyCalls != 0 {
-		t.Errorf("expected no fence invocation after preflight failed; calls=%d", local.setReadOnlyCalls)
+	if local.setReadOnlyCalls.Load() != 0 {
+		t.Errorf("expected no fence invocation after preflight failed; calls=%d", local.setReadOnlyCalls.Load())
 	}
-	if proxy.applyCalls != 0 {
-		t.Errorf("expected no routing change after preflight failed; calls=%d", proxy.applyCalls)
+	if proxy.ApplyCalls() != 0 {
+		t.Errorf("expected no routing change after preflight failed; calls=%d", proxy.ApplyCalls())
 	}
 	if res.PreFlight == nil || res.PreFlight.OK() {
 		t.Errorf("expected PreFlight result to be present and non-OK")
@@ -188,21 +201,21 @@ func TestEngine_PreFlightFailShortCircuits(t *testing.T) {
 type stubPXC struct {
 	writable          bool
 	setReadOnlyErr    error
-	setReadOnlyCalls  int
+	setReadOnlyCalls  atomic.Int32
 	setReadWriteErr   error
-	setReadWriteCalls int
+	setReadWriteCalls atomic.Int32
 }
 
 func (s *stubPXC) IsWritable(context.Context) (bool, error) { return s.writable, nil }
 func (s *stubPXC) SetReadOnly(context.Context) error {
-	s.setReadOnlyCalls++
+	s.setReadOnlyCalls.Add(1)
 	if s.setReadOnlyErr == nil {
 		s.writable = false
 	}
 	return s.setReadOnlyErr
 }
 func (s *stubPXC) SetReadWrite(context.Context) error {
-	s.setReadWriteCalls++
+	s.setReadWriteCalls.Add(1)
 	if s.setReadWriteErr == nil {
 		s.writable = true
 	}
@@ -216,6 +229,196 @@ func containsEvent(events []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// pxcVerifyFail implements PXCManager: SetReadWrite succeeds but IsWritable
+// always returns false — simulates MANO saying COMPLETED while MySQL is still
+// catching up on the read_only change.
+type pxcVerifyFail struct {
+	setReadWriteCalls atomic.Int32
+	setReadOnlyCalls  atomic.Int32
+}
+
+func (s *pxcVerifyFail) IsWritable(_ context.Context) (bool, error) { return false, nil }
+func (s *pxcVerifyFail) SetReadOnly(_ context.Context) error {
+	s.setReadOnlyCalls.Add(1)
+	return nil
+}
+func (s *pxcVerifyFail) SetReadWrite(_ context.Context) error {
+	s.setReadWriteCalls.Add(1)
+	return nil
+}
+
+// failingReplication always fails StopReplica — used to simulate the former
+// source being down during the ReverseReplica phase.
+type failingReplication struct{}
+
+func (f *failingReplication) StopReplica(_ context.Context, _ string) error {
+	return errors.New("former source unreachable: connection refused")
+}
+func (f *failingReplication) ResetReplicaAll(_ context.Context, _ string) error {
+	return errors.New("former source unreachable: connection refused")
+}
+
+// TestEngine_VerifyFailDoesNotRollback: post-promote verification failing must
+// NOT trigger a rollback. The MySQL promote already completed; rolling back
+// would create more churn than it fixes. Manual intervention is required.
+func TestEngine_VerifyFailDoesNotRollback(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &pxcVerifyFail{} // SetReadWrite OK but IsWritable stays false
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: true,
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:                local,
+		RemotePXC:               remote,
+		LocalInspector:          inspector,
+		RemoteInspector:         inspector,
+		LocalProxySQL:           proxy,
+		LocalReplicationChannel: "dc-to-dr",
+		FenceTimeout:            time.Second,
+		Progress:                reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if res.Success {
+		t.Fatal("expected Verify failure")
+	}
+	if res.FailedPhase != PhaseVerify {
+		t.Errorf("expected FailedPhase=Verify, got %s", res.FailedPhase)
+	}
+	if res.RolledBack {
+		t.Error("Verify failure must NOT set RolledBack — no rollback should be attempted")
+	}
+	// Rollback of Fence would re-enable writes on local; must not happen.
+	if local.setReadWriteCalls.Load() != 0 {
+		t.Errorf("rollback SetReadWrite on local must not be called; calls=%d", local.setReadWriteCalls.Load())
+	}
+	// Rollback of Promote would demote remote back to RO; must not happen.
+	if remote.setReadOnlyCalls.Load() != 0 {
+		t.Errorf("rollback SetReadOnly on remote must not be called; calls=%d", remote.setReadOnlyCalls.Load())
+	}
+}
+
+// TestEngine_ReverseReplicaFailIsNonFatal: when the former source is still
+// down, StopReplica fails during ReverseReplica — the engine must still
+// report Success=true and proceed to Verify, not abort.
+func TestEngine_ReverseReplicaFailIsNonFatal(t *testing.T) {
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: true,
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:                 local,
+		RemotePXC:                remote,
+		LocalInspector:           inspector,
+		RemoteInspector:          inspector,
+		LocalProxySQL:            proxy,
+		LocalReplicationChannel:  "dc-to-dr",
+		RemoteReplicationChannel: "dc-to-dr",
+		LocalReplication:         &failingReplication{},
+		ReverseReplicationSource: &ReverseReplicationSource{
+			Host: "new-source.example.com",
+			Port: 3306,
+		},
+		FenceTimeout: time.Second,
+		Progress:     reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if !res.Success {
+		t.Fatalf("expected Success=true despite ReverseReplica failure; got err=%v phase=%s",
+			res.Error, res.FailedPhase)
+	}
+	// Reporter must have logged the deferral.
+	if !containsEvent(reporter.Events(), "error:ReverseReplica") {
+		t.Errorf("expected error:ReverseReplica in reporter events; got %v", reporter.Events())
+	}
+	// Verify must still have run and completed.
+	if !containsEvent(reporter.Events(), "complete:Verify") {
+		t.Errorf("expected complete:Verify after ReverseReplica error; got %v", reporter.Events())
+	}
+}
+
+// TestEngine_BlackholeFenceFails_Aborts: when both the SQL fence and the
+// ProxySQL blackhole fence fail, the engine must abort at Fence to prevent
+// any promote path that could leave the cluster split-brain.
+func TestEngine_BlackholeFenceFails_Aborts(t *testing.T) {
+	local := &stubPXC{writable: true, setReadOnlyErr: errors.New("connection refused")}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: false, // local truly down
+	}
+	proxy := &recordingProxy{blackholeErr: errors.New("all ProxySQL instances unreachable")}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:                local,
+		RemotePXC:               remote,
+		LocalInspector:          inspector,
+		RemoteInspector:         inspector,
+		LocalProxySQL:           proxy,
+		LocalReplicationChannel: "dc-to-dr",
+		FenceTimeout:            time.Second,
+		Progress:                reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if res.Success {
+		t.Fatal("expected engine to abort when both SQL fence and blackhole fence fail")
+	}
+	if res.FailedPhase != PhaseFence {
+		t.Errorf("expected FailedPhase=Fence, got %s", res.FailedPhase)
+	}
+	if proxy.BlackholeCalls() == 0 {
+		t.Error("expected Blackhole to have been attempted before abort")
+	}
+	if proxy.ApplyCalls() != 0 {
+		t.Errorf("expected no routing change after total fence failure; applyCalls=%d", proxy.ApplyCalls())
+	}
+}
+
+// TestEngine_FenceNoProxySQL_WhenLocalUnreachable_Aborts: if the SQL fence
+// fails and the local cluster is down, but no ProxySQL blackhole is configured,
+// the engine must abort — promoting without any write fence risks split-brain
+// if local recovers.
+func TestEngine_FenceNoProxySQL_WhenLocalUnreachable_Aborts(t *testing.T) {
+	local := &stubPXC{writable: true, setReadOnlyErr: errors.New("connection refused")}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot:       goodSnapshot("dc:1-100"),
+		probeReachable: false, // local truly down
+	}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:                local,
+		RemotePXC:               remote,
+		LocalInspector:          inspector,
+		RemoteInspector:         inspector,
+		LocalProxySQL:           nil, // no blackhole configured
+		LocalReplicationChannel: "dc-to-dr",
+		FenceTimeout:            time.Second,
+		Progress:                reporter,
+	})
+
+	res := e.Execute(context.Background())
+	if res.Success {
+		t.Fatal("expected engine to abort when local is down and no ProxySQL blackhole configured")
+	}
+	if res.FailedPhase != PhaseFence {
+		t.Errorf("expected FailedPhase=Fence, got %s", res.FailedPhase)
+	}
 }
 
 // TestEngine_PromoteFailRollbacksFence confirms that a Promote failure
@@ -305,8 +508,8 @@ func TestEngine_RoutingFailRollsBackPromoteAndFence(t *testing.T) {
 	// nothing to revert via RollbackRouting. The rollback covers Promote and
 	// Fence only — a RollbackRouting call here would be a bug (it would
 	// double-apply the original routing on instances that never changed).
-	if proxy.backCalls != 0 {
-		t.Errorf("expected no RollbackRouting call on failed Apply, got %d", proxy.backCalls)
+	if proxy.BackCalls() != 0 {
+		t.Errorf("expected no RollbackRouting call on failed Apply, got %d", proxy.BackCalls())
 	}
 }
 
@@ -342,9 +545,9 @@ func TestEngine_GTIDCatchupTimeoutAborts(t *testing.T) {
 		t.Fatalf("expected PreFlight abort due to C6 timeout; got success=%v phase=%s",
 			res.Success, res.FailedPhase)
 	}
-	if local.setReadOnlyCalls != 0 || remote.setReadWriteCalls != 0 {
+	if local.setReadOnlyCalls.Load() != 0 || remote.setReadWriteCalls.Load() != 0 {
 		t.Errorf("expected no state changes after PreFlight abort; fence=%d promote=%d",
-			local.setReadOnlyCalls, remote.setReadWriteCalls)
+			local.setReadOnlyCalls.Load(), remote.setReadWriteCalls.Load())
 	}
 	if !inspectorRemote.waitInvoked {
 		t.Error("expected WaitForGTID to have been invoked")
@@ -380,16 +583,17 @@ func TestEngine_ProgressReporterSeesAllPhases(t *testing.T) {
 		t.Fatalf("expected happy path; got: %v", res.Error)
 	}
 
+	events := reporter.Events()
 	wantPhases := []string{"PreFlight", "Fence", "Promote", "Routing", "ReverseReplica", "Verify"}
 	for _, phase := range wantPhases {
-		if !containsEvent(reporter.events, "start:"+phase) {
-			t.Errorf("missing start:%s in reporter events: %v", phase, reporter.events)
+		if !containsEvent(events, "start:"+phase) {
+			t.Errorf("missing start:%s in reporter events: %v", phase, events)
 		}
 	}
 	// Every successful phase must have a paired complete event (ReverseReplica
 	// is best-effort so it may report error without aborting, but Verify must
 	// always complete on the happy path).
-	if !containsEvent(reporter.events, "complete:Verify") {
-		t.Errorf("missing complete:Verify in reporter events: %v", reporter.events)
+	if !containsEvent(events, "complete:Verify") {
+		t.Errorf("missing complete:Verify in reporter events: %v", events)
 	}
 }

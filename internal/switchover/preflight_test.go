@@ -20,6 +20,10 @@ type fakeInspector struct {
 	waitErr          error
 	waitInvoked      bool
 	waitArg          string
+	// catchupAfterWait: if true, WaitForGTID swaps missingResult to missingAfterWait,
+	// modelling the case where the remote catches up during the wait window.
+	catchupAfterWait bool
+	missingAfterWait string
 	repStatus        pxc.ReplicationStatus
 	repErr           error
 	probeReachable   bool
@@ -44,6 +48,9 @@ func (f *fakeInspector) MissingGTIDs(_ context.Context, _ string) (string, error
 func (f *fakeInspector) WaitForGTID(_ context.Context, gtid string, _ time.Duration) error {
 	f.waitInvoked = true
 	f.waitArg = gtid
+	if f.catchupAfterWait {
+		f.missingResult = f.missingAfterWait
+	}
 	return f.waitErr
 }
 func (f *fakeInspector) GetReplicationStatus(context.Context, string) (pxc.ReplicationStatus, error) {
@@ -231,6 +238,254 @@ func goodSnapshot(gtid string) pxc.GTIDSnapshot {
 		LogReplicaUpdatesOn:     true,
 		BinlogFormat:            "ROW",
 		GTIDMode:                "ON",
+	}
+}
+
+// TestPreFlight_C3_RemoteReplicationNotRunning verifies that stopped IO/SQL
+// threads block the switchover (C3_RemoteReplicationRunning is a hard check).
+func TestPreFlight_C3_RemoteReplicationNotRunning(t *testing.T) {
+	gtid := "dc:1-100"
+	local := &fakeInspector{snapshot: goodSnapshot(gtid)}
+	remote := &fakeInspector{
+		snapshot: goodSnapshot(gtid),
+		repStatus: pxc.ReplicationStatus{
+			ChannelName:     "dc-to-dr",
+			ConfigExists:    true,
+			IOServiceState:  "OFF",
+			SQLServiceState: "OFF",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+	}
+	res := p.Run(context.Background())
+	if res.OK() {
+		t.Fatalf("expected preflight to fail when replication is stopped; got: %s", res.Summary())
+	}
+	mustHaveCheckFailed(t, res, "C3_RemoteReplicationRunning")
+}
+
+// TestPreFlight_C8_BinlogFormatNotRow verifies that a non-ROW binlog_format
+// is a hard failure — mixed/statement replication breaks GTID-based recovery.
+func TestPreFlight_C8_BinlogFormatNotRow(t *testing.T) {
+	gtid := "dc:1-100"
+	snap := goodSnapshot(gtid)
+	snap.BinlogFormat = "STATEMENT"
+	local := &fakeInspector{snapshot: goodSnapshot(gtid)}
+	remote := &fakeInspector{
+		snapshot: snap,
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+	}
+	res := p.Run(context.Background())
+	if res.OK() {
+		t.Fatalf("expected preflight to fail with binlog_format=STATEMENT; got: %s", res.Summary())
+	}
+	mustHaveCheckFailed(t, res, "C8_BinlogFormatRow")
+}
+
+// TestPreFlight_C9_GTIDModeNotOn verifies that gtid_mode != ON is a hard
+// failure. Without GTID mode the entire GTID-position-based flip is undefined.
+func TestPreFlight_C9_GTIDModeNotOn(t *testing.T) {
+	gtid := "dc:1-100"
+	snap := goodSnapshot(gtid)
+	snap.GTIDMode = "OFF"
+	local := &fakeInspector{snapshot: goodSnapshot(gtid)}
+	remote := &fakeInspector{
+		snapshot: snap,
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+	}
+	res := p.Run(context.Background())
+	if res.OK() {
+		t.Fatalf("expected preflight to fail with gtid_mode=OFF; got: %s", res.Summary())
+	}
+	mustHaveCheckFailed(t, res, "C9_GTIDModeOn")
+}
+
+// TestPreFlight_C10_RemotePurgedAheadOfLocal locks in the C10 invariant: if the
+// remote has already purged binlogs for GTIDs that local has not yet executed,
+// local can never catch up after it recovers — the flip would create a permanent
+// replication gap (Error 1236).
+func TestPreFlight_C10_RemotePurgedAheadOfLocal(t *testing.T) {
+	snap := goodSnapshot("dc:1-100")
+	snap.Purged = "dc:1-50" // remote has purged these; local must have them all
+	// local.MissingGTIDs returns non-empty → local is missing some of remote's purged set
+	local := &fakeInspector{
+		snapshot:      goodSnapshot("dc:1-100"),
+		missingResult: "dc:1-10",
+	}
+	remote := &fakeInspector{
+		snapshot: snap,
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+	}
+	res := p.Run(context.Background())
+	if res.OK() {
+		t.Fatalf("expected C10 to block when remote purged > local executed; got: %s", res.Summary())
+	}
+	mustHaveCheckFailed(t, res, "C10_RemotePurgedNotAhead")
+}
+
+// TestPreFlight_AllowDataLossFailover_LocalUnreachable verifies that setting
+// AllowDataLossFailover=true with a nil LocalInspector marks GTID checks as
+// skipped rather than blocking the flip — the operator has explicitly accepted
+// the risk of transaction loss.
+func TestPreFlight_AllowDataLossFailover_LocalUnreachable(t *testing.T) {
+	remote := &fakeInspector{
+		snapshot: goodSnapshot("dc:1-100"),
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:              &fakePXC{writable: true},
+		RemotePXC:             &fakePXC{writable: false},
+		LocalInspector:        nil, // local cluster is destroyed
+		RemoteInspector:       remote,
+		Channel:               "dc-to-dr",
+		AllowDataLossFailover: true,
+	}
+	res := p.Run(context.Background())
+	if !res.OK() {
+		t.Fatalf("expected preflight to pass with AllowDataLossFailover=true; got: %s", res.Summary())
+	}
+}
+
+// TestPreFlight_AllChecksRunDespiteEarlyHardFailure confirms that Run never
+// short-circuits on the first hard failure — the full check set is evaluated so
+// the operator sees every issue in one reconcile cycle, not one at a time.
+func TestPreFlight_AllChecksRunDespiteEarlyHardFailure(t *testing.T) {
+	gtid := "dc:1-100"
+	snap := goodSnapshot(gtid)
+	snap.BinlogFormat = "STATEMENT"     // C8 hard fail
+	snap.GTIDMode = "OFF"               // C9 hard fail
+	snap.LogReplicaUpdatesOn = false    // C7 hard fail
+	local := &fakeInspector{snapshot: goodSnapshot(gtid)}
+	remote := &fakeInspector{
+		snapshot: snap,
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+	}
+	res := p.Run(context.Background())
+	if res.OK() {
+		t.Fatalf("expected preflight to fail with multiple hard checks tripped")
+	}
+	// All three checks must appear — not just the first one encountered.
+	mustHaveCheckFailed(t, res, "C7_RemoteLogReplicaUpdates")
+	mustHaveCheckFailed(t, res, "C8_BinlogFormatRow")
+	mustHaveCheckFailed(t, res, "C9_GTIDModeOn")
+}
+
+// TestPreFlight_C6_WaitIsInvokedWithLocalGTID verifies that when C5 fails
+// (remote is behind), WaitForGTID is called with the LOCAL cluster's executed
+// GTID set — not the remote's own position. Passing the remote's GTID to the
+// wait would be a no-op: the remote already has its own GTIDs.
+func TestPreFlight_C6_WaitIsInvokedWithLocalGTID(t *testing.T) {
+	localGTID := "dc:1-1000"
+	local := &fakeInspector{snapshot: goodSnapshot(localGTID)}
+	remote := &fakeInspector{
+		snapshot:      goodSnapshot("dc:1-990"),
+		missingResult: "dc:991-1000",
+		waitErr:       errors.New("replica did not reach target GTID within 500ms"),
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+		CatchupTimeout:  500 * time.Millisecond,
+	}
+	p.Run(context.Background())
+
+	if !remote.waitInvoked {
+		t.Error("expected WaitForGTID to be invoked when C5 fails")
+	}
+	if remote.waitArg != localGTID {
+		t.Errorf("WaitForGTID called with %q; want local GTID %q", remote.waitArg, localGTID)
+	}
+}
+
+// TestPreFlight_C5_GTIDCatchupRecovery verifies the recovery branch at
+// preflight.go:283-287: when C5 initially fails (remote is behind) but
+// WaitForGTID succeeds and the post-wait MissingGTIDs check returns empty,
+// C5 is upgraded to passed — the remote caught up during the wait window.
+// A regression that skips this re-check would cause PreFlight to reject
+// switchovers even after the replica successfully caught up.
+func TestPreFlight_C5_GTIDCatchupRecovery(t *testing.T) {
+	localGTID := "dc:1-1000"
+	local := &fakeInspector{snapshot: goodSnapshot(localGTID)}
+	remote := &fakeInspector{
+		snapshot:         goodSnapshot("dc:1-990"),
+		missingResult:    "dc:991-1000", // initially behind
+		catchupAfterWait: true,          // WaitForGTID flips missingResult to "" below
+		missingAfterWait: "",            // empty = fully caught up after wait
+		waitErr:          nil,
+		repStatus: pxc.ReplicationStatus{
+			ChannelName: "dc-to-dr", ConfigExists: true,
+			IOServiceState: "ON", SQLServiceState: "ON",
+		},
+	}
+	p := PreFlight{
+		LocalPXC:        &fakePXC{writable: true},
+		RemotePXC:       &fakePXC{writable: false},
+		LocalInspector:  local,
+		RemoteInspector: remote,
+		Channel:         "dc-to-dr",
+		CatchupTimeout:  5 * time.Second,
+	}
+	res := p.Run(context.Background())
+	if !res.OK() {
+		t.Fatalf("expected C5 to pass after remote caught up during WaitForGTID; got: %s", res.Summary())
+	}
+	if !remote.waitInvoked {
+		t.Error("expected WaitForGTID to be invoked")
 	}
 }
 

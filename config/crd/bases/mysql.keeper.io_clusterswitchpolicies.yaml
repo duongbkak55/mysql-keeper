@@ -312,6 +312,48 @@ spec:
                   - host
                   type: object
                 type: array
+              proxySQLSelector:
+                description: |-
+                  ProxySQLSelector discovers ProxySQL admin endpoints dynamically at each
+                  reconcile by listing Pods matching the given label selector. Use this when
+                  ProxySQL is deployed as a Deployment (pod IPs change on heal/restart).
+                  Mutually exclusive with proxySQL.
+                properties:
+                  adminPort:
+                    default: 6032
+                    description: AdminPort is the ProxySQL admin interface port. Default
+                      6032.
+                    format: int32
+                    type: integer
+                  credentialsSecretRef:
+                    description: CredentialsSecretRef refers to a Secret with "username"
+                      and "password" for ProxySQL admin.
+                    properties:
+                      name:
+                        description: Name of the Secret.
+                        type: string
+                      namespace:
+                        description: Namespace of the Secret. Defaults to the controller's
+                          namespace if omitted.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: MatchLabels is a map of key=value pairs that ProxySQL
+                      pods must carry.
+                    minProperties: 1
+                    type: object
+                  namespace:
+                    description: Namespace where the ProxySQL pods run.
+                    type: string
+                required:
+                - credentialsSecretRef
+                - matchLabels
+                - namespace
+                type: object
               pxcName:
                 description: PXCName is the name of the local PerconaXtraDBCluster
                   resource.
@@ -512,7 +554,6 @@ spec:
             - clusterRole
             - healthCheck
             - localMySQL
-            - proxySQL
             - pxcName
             - pxcNamespace
             - remoteMySQL

@@ -73,8 +73,9 @@ func main() {
 	}
 
 	if err = (&controller.ClusterSwitchPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("mysql-keeper-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create ClusterSwitchPolicy controller")
 		os.Exit(1)

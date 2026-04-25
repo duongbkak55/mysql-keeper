@@ -166,6 +166,35 @@ var (
 		},
 		[]string{"cluster_role", "scope"},
 	)
+
+	// GTIDMissingTransactions is the number of GTID transactions present on
+	// the source cluster that the replica has not yet applied. Updated every
+	// reconcile. A sustained non-zero value means the replica is falling
+	// behind; alert before this reaches a point where preflight C5 blocks a
+	// switchover.
+	// Labels: cluster_role
+	GTIDMissingTransactions = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mysql_keeper",
+			Name:      "gtid_missing_transactions",
+			Help:      "Transactions present on the source not yet applied by the replica (GTID_SUBTRACT count).",
+		},
+		[]string{"cluster_role"},
+	)
+
+	// ReplicationLagSeconds is the estimated replication lag derived from the
+	// ORIGINAL_COMMIT_TIMESTAMP of the last applied transaction on the replica.
+	// -1 means the value is unavailable (channel idle, not yet configured, or
+	// no transactions replicated). Alert when this exceeds your RTO budget.
+	// Labels: cluster_role, channel
+	ReplicationLagSeconds = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replication_lag_seconds",
+			Help:      "Estimated replication lag in seconds based on ORIGINAL_COMMIT_TIMESTAMP. -1 if unavailable.",
+		},
+		[]string{"cluster_role", "channel"},
+	)
 )
 
 func init() {
@@ -185,5 +214,7 @@ func init() {
 		ReplicationChannelIORunning,
 		ReplicationChannelSQLRunning,
 		BinlogExpireLogsSeconds,
+		GTIDMissingTransactions,
+		ReplicationLagSeconds,
 	)
 }

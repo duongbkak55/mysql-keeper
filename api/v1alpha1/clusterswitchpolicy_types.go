@@ -72,8 +72,18 @@ type ClusterSwitchPolicySpec struct {
 	// Used for health monitoring and promoting/fencing the remote cluster.
 	RemoteMySQL MySQLEndpointConfig `json:"remoteMySQL"`
 
-	// ProxySQL lists the local ProxySQL admin endpoints (typically 3 instances).
-	ProxySQL []ProxySQLEndpoint `json:"proxySQL"`
+	// ProxySQL lists the local ProxySQL admin endpoints (static list).
+	// Use for StatefulSet-based ProxySQL with stable pod DNS names.
+	// Mutually exclusive with ProxySQLSelector; if both are set ProxySQLSelector takes precedence.
+	// +optional
+	ProxySQL []ProxySQLEndpoint `json:"proxySQL,omitempty"`
+
+	// ProxySQLSelector discovers ProxySQL admin endpoints dynamically at each
+	// reconcile by listing Pods matching the given label selector. Use this when
+	// ProxySQL is deployed as a Deployment (pod IPs change on heal/restart).
+	// Mutually exclusive with ProxySQL.
+	// +optional
+	ProxySQLSelector *ProxySQLSelectorConfig `json:"proxySQLSelector,omitempty"`
 
 	// HealthCheck defines thresholds and intervals for health monitoring.
 	HealthCheck HealthCheckConfig `json:"healthCheck"`
@@ -198,6 +208,26 @@ type MySQLEndpointConfig struct {
 	CredentialsSecretRef SecretRef `json:"credentialsSecretRef"`
 }
 
+// ProxySQLSelectorConfig discovers ProxySQL pod endpoints dynamically by
+// listing Pods that match a label selector. The controller queries the k8s API
+// at each reconcile cycle so endpoints are always current regardless of pod
+// restarts or IP changes caused by Deployment healing.
+type ProxySQLSelectorConfig struct {
+	// Namespace where the ProxySQL pods run.
+	Namespace string `json:"namespace"`
+
+	// MatchLabels is a map of key=value pairs that ProxySQL pods must carry.
+	MatchLabels map[string]string `json:"matchLabels"`
+
+	// AdminPort is the ProxySQL admin interface port. Default 6032.
+	// +kubebuilder:default=6032
+	// +optional
+	AdminPort int32 `json:"adminPort,omitempty"`
+
+	// CredentialsSecretRef refers to a Secret with "username" and "password" for ProxySQL admin.
+	CredentialsSecretRef SecretRef `json:"credentialsSecretRef"`
+}
+
 // ProxySQLEndpoint defines a single ProxySQL admin interface.
 //
 // The controller talks to ProxySQL on its admin port (default 6032) to:
@@ -251,6 +281,16 @@ type HealthCheckConfig struct {
 	// that must be reachable to consider ProxySQL healthy.
 	// +kubebuilder:default=2
 	ProxySQLMinHealthy int32 `json:"proxySQLMinHealthy"`
+
+	// GTIDLagAlertThresholdTransactions, when positive, causes the controller
+	// to emit a Warning Kubernetes event on the CR whenever the number of
+	// unapplied GTID transactions on the replica exceeds this value.
+	// 0 (default) disables the event. Use this for an early warning before
+	// replication lag grows to the point where preflight C5/C6 would block
+	// a switchover.
+	// +kubebuilder:default=0
+	// +optional
+	GTIDLagAlertThresholdTransactions int64 `json:"gtidLagAlertThresholdTransactions,omitempty"`
 }
 
 // SwitchoverConfig defines switchover behavior and ProxySQL hostgroup IDs.
@@ -368,6 +408,13 @@ type ClusterSwitchPolicyStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
+	// GTIDLag is the most recent replication-lag measurement between the
+	// source cluster and its replica. Updated every reconcile when a
+	// replication channel is configured. Use this for quick visibility via
+	// "kubectl describe" without reading Prometheus.
+	// +optional
+	GTIDLag *GTIDLagStatus `json:"gtidLag,omitempty"`
+
 	// ObservedGeneration is the last spec generation the controller processed.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
@@ -444,6 +491,22 @@ type PreFlightConfig struct {
 	// +kubebuilder:default=604800
 	// +optional
 	MinBinlogRetentionSeconds int64 `json:"minBinlogRetentionSeconds,omitempty"`
+}
+
+// GTIDLagStatus captures a point-in-time GTID replication-lag measurement
+// between the source cluster and its replica.
+type GTIDLagStatus struct {
+	// MissingTransactions is the number of GTID transactions present on the
+	// source that the replica has not yet applied (GTID_SUBTRACT count).
+	MissingTransactions int64 `json:"missingTransactions"`
+
+	// LagSeconds is the estimated lag derived from the ORIGINAL_COMMIT_TIMESTAMP
+	// of the last applied transaction on the replica. -1 means no data was
+	// available (channel idle, not yet configured, or no transactions replicated).
+	LagSeconds int64 `json:"lagSeconds"`
+
+	// MeasuredAt is when this measurement was collected.
+	MeasuredAt metav1.Time `json:"measuredAt"`
 }
 
 // ClusterHealthStatus holds the observed health of one cluster.

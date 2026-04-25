@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,11 +54,13 @@ import (
 // +kubebuilder:rbac:groups=mysql.keeper.io,resources=clusterswitchpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pxc.percona.com,resources=perconaxtradbclusters,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 type ClusterSwitchPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // componentSet groups everything we build per-reconcile so the signature of
@@ -154,6 +157,7 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	r.updateMetrics(policy, localHealth, remoteHealth)
 	r.observeReplicationMetrics(ctx, policy, comps)
+	gtidMissing, gtidLagSec, gtidMeasured := r.observeGTIDLag(ctx, policy, comps)
 
 	// Persist the counters/health derived from this cycle before any further
 	// branching. We keep the merge base cloned before we mutate the status so
@@ -161,8 +165,22 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	healthPatch := client.MergeFrom(policy.DeepCopy())
 	r.updateHealthStatus(policy, localHealth, remoteHealth)
 	r.updateSplitBrainCondition(policy, localHealth, remoteHealth)
+	if gtidMeasured {
+		policy.Status.GTIDLag = gtidLagStatusFor(gtidMissing, gtidLagSec)
+	}
 	if err := r.Status().Patch(ctx, policy, healthPatch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch health status: %w", err)
+	}
+
+	// Emit a Warning event when the replica is falling behind. This shows up
+	// in "kubectl describe" and streams to any event watchers. The Prometheus
+	// metrics (GTIDMissingTransactions / ReplicationLagSeconds) are the primary
+	// alerting surface; the event is an early visual signal for on-call.
+	if threshold := policy.Spec.HealthCheck.GTIDLagAlertThresholdTransactions; gtidMeasured &&
+		r.Recorder != nil && threshold > 0 && gtidMissing > threshold {
+		r.Recorder.Event(policy, corev1.EventTypeWarning, "GTIDLagHigh",
+			fmt.Sprintf("GTID lag: %d unapplied transactions exceeds threshold %d — replication falling behind",
+				gtidMissing, threshold))
 	}
 
 	// Try to ensure keeper.probe / keeper.leader on the writable side. This is
@@ -726,20 +744,9 @@ func (r *ClusterSwitchPolicyReconciler) buildComponents(
 	)
 	remotePXCChecker := health.NewRemotePXCChecker(remoteDSN, timeout)
 
-	proxySQLEndpoints := make([]health.ProxySQLEndpointInfo, 0, len(policy.Spec.ProxySQL))
-	proxySQLMgrEndpoints := make([]proxysql.Endpoint, 0, len(policy.Spec.ProxySQL))
-
-	for _, ep := range policy.Spec.ProxySQL {
-		u, p, err := r.readSecret(ctx, ep.CredentialsSecretRef)
-		if err != nil {
-			return nil, fmt.Errorf("ProxySQL creds for %s: %w", ep.Host, err)
-		}
-		proxySQLEndpoints = append(proxySQLEndpoints, health.ProxySQLEndpointInfo{
-			Host: ep.Host, Port: ep.AdminPort, Username: u, Password: p,
-		})
-		proxySQLMgrEndpoints = append(proxySQLMgrEndpoints, proxysql.Endpoint{
-			Host: ep.Host, Port: ep.AdminPort, Username: u, Password: p,
-		})
+	proxySQLMgrEndpoints, proxySQLEndpoints, err := r.resolveProxySQLEndpoints(ctx, policy)
+	if err != nil {
+		return nil, err
 	}
 
 	proxySQLChecker := health.NewProxySQLChecker(proxySQLEndpoints, timeout)
@@ -908,4 +915,85 @@ func (r *ClusterSwitchPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mysqlv1alpha1.ClusterSwitchPolicy{}).
 		Complete(r)
+}
+
+// resolveProxySQLEndpoints returns the ProxySQL endpoint lists for the manager
+// and health checker. When proxySQLSelector is set it discovers pods dynamically
+// via the k8s API; otherwise it falls back to the static proxySQL list.
+// Returns an error if neither is configured or if pod listing fails.
+func (r *ClusterSwitchPolicyReconciler) resolveProxySQLEndpoints(
+	ctx context.Context,
+	policy *mysqlv1alpha1.ClusterSwitchPolicy,
+) ([]proxysql.Endpoint, []health.ProxySQLEndpointInfo, error) {
+	if policy.Spec.ProxySQLSelector != nil {
+		return r.resolveProxySQLBySelector(ctx, policy.Spec.ProxySQLSelector)
+	}
+	if len(policy.Spec.ProxySQL) == 0 {
+		return nil, nil, fmt.Errorf("spec.proxySQL and spec.proxySQLSelector are both unset; at least one is required")
+	}
+	var mgrEps []proxysql.Endpoint
+	var healthEps []health.ProxySQLEndpointInfo
+	for _, ep := range policy.Spec.ProxySQL {
+		u, p, err := r.readSecret(ctx, ep.CredentialsSecretRef)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ProxySQL creds for %s: %w", ep.Host, err)
+		}
+		port := ep.AdminPort
+		if port == 0 {
+			port = 6032
+		}
+		mgrEps = append(mgrEps, proxysql.Endpoint{Host: ep.Host, Port: port, Username: u, Password: p})
+		healthEps = append(healthEps, health.ProxySQLEndpointInfo{Host: ep.Host, Port: port, Username: u, Password: p})
+	}
+	return mgrEps, healthEps, nil
+}
+
+// resolveProxySQLBySelector lists all Running+Ready pods matching the selector
+// and builds endpoint slices from their pod IPs. Called at every reconcile so
+// endpoints are always fresh after Deployment pod restarts or IP changes.
+func (r *ClusterSwitchPolicyReconciler) resolveProxySQLBySelector(
+	ctx context.Context,
+	cfg *mysqlv1alpha1.ProxySQLSelectorConfig,
+) ([]proxysql.Endpoint, []health.ProxySQLEndpointInfo, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(cfg.Namespace),
+		client.MatchingLabels(cfg.MatchLabels),
+	); err != nil {
+		return nil, nil, fmt.Errorf("list ProxySQL pods (selector=%v): %w", cfg.MatchLabels, err)
+	}
+
+	u, p, err := r.readSecret(ctx, cfg.CredentialsSecretRef)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ProxySQL selector creds: %w", err)
+	}
+	port := cfg.AdminPort
+	if port == 0 {
+		port = 6032
+	}
+
+	var mgrEps []proxysql.Endpoint
+	var healthEps []health.ProxySQLEndpointInfo
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+			continue
+		}
+		if !proxySQLPodReady(pod) {
+			continue
+		}
+		mgrEps = append(mgrEps, proxysql.Endpoint{Host: pod.Status.PodIP, Port: port, Username: u, Password: p})
+		healthEps = append(healthEps, health.ProxySQLEndpointInfo{Host: pod.Status.PodIP, Port: port, Username: u, Password: p})
+	}
+	return mgrEps, healthEps, nil
+}
+
+// proxySQLPodReady returns true when the pod's Ready condition is True.
+func proxySQLPodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }

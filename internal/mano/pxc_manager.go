@@ -28,6 +28,24 @@ import (
 	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
+// sqlOps is the minimal direct-MySQL surface PXCManager needs for reads,
+// replication manipulation, and write probes. *pxc.Manager satisfies this
+// interface at runtime; tests inject a stub.
+type sqlOps interface {
+	IsWritable(ctx context.Context) (bool, error)
+	GetGTIDSnapshot(ctx context.Context) (pxc.GTIDSnapshot, error)
+	GetExecutedGTID(ctx context.Context) (string, error)
+	IsGTIDSubset(ctx context.Context, other string) (bool, error)
+	MissingGTIDs(ctx context.Context, other string) (string, error)
+	WaitForGTID(ctx context.Context, gtid string, timeout time.Duration) error
+	GetReplicationStatus(ctx context.Context, channel string) (pxc.ReplicationStatus, error)
+	ProbeReachable(ctx context.Context, budget time.Duration) (bool, error)
+	StopReplica(ctx context.Context, channel string) error
+	ResetReplicaAll(ctx context.Context, channel string) error
+	EnsureKeeperSchema(ctx context.Context) error
+	VerifyWrite(ctx context.Context) error
+}
+
 // PXCManager controls a PXC cluster via the MANO LCM API for state toggles,
 // and uses an embedded pxc.Manager for all direct-to-MySQL introspection.
 type PXCManager struct {
@@ -39,7 +57,7 @@ type PXCManager struct {
 
 	// sql is the direct-MySQL helper used for reads and replication channel
 	// manipulation. Created from (mysqlDSN, mysqlTimeout); never talks to MANO.
-	sql *pxc.Manager
+	sql sqlOps
 }
 
 // NewPXCManager creates a MANO-backed PXCManager.
@@ -60,6 +78,24 @@ func NewPXCManager(
 		pollInterval: pollInterval,
 		pollTimeout:  pollTimeout,
 		sql:          pxc.NewRemoteManager(mysqlDSN, mysqlTimeout),
+	}
+}
+
+// NewPXCManagerForTest creates a PXCManager with an injected sqlOps implementation.
+// Use only in tests.
+func NewPXCManagerForTest(
+	mano *Client,
+	cnfName, vduName string,
+	pollInterval, pollTimeout time.Duration,
+	sql sqlOps,
+) *PXCManager {
+	return &PXCManager{
+		mano:         mano,
+		cnfName:      cnfName,
+		vduName:      vduName,
+		pollInterval: pollInterval,
+		pollTimeout:  pollTimeout,
+		sql:          sql,
 	}
 }
 

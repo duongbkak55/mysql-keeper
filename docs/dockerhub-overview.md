@@ -121,12 +121,33 @@ retention ≥ 7 days, `allowDataLossFailover: false`).
 
 Exposed on `:8080/metrics`. Keeper-specific series (all `mysql_keeper_` prefix):
 
+**Health & switchover**
 - `cluster_healthy`, `cluster_writable` — tri-state gauges per (role, scope)
 - `switchover_total` by result, `switchover_duration_seconds` histogram
 - `preflight_failures_total` by phase, `fence_failures_total` by path
 - `both_clusters_readonly_total`, `both_clusters_writable_total` — safety counters
 - `cooldown_block_total`, `manual_intervention_required_total`
-- `replication_channel_{io,sql}_running`, `binlog_expire_logs_seconds`
+
+**Replication health (updated every reconcile)**
+- `replication_channel_{io,sql}_running` — 1 if thread running, 0 otherwise
+- `binlog_expire_logs_seconds` — current retention window
+- `gtid_missing_transactions{cluster_role}` — transactions on the source not yet applied by the replica (`GTID_SUBTRACT` count). Alert when this is non-zero for more than a few minutes.
+- `replication_lag_seconds{cluster_role,channel}` — estimated lag in seconds from `ORIGINAL_COMMIT_TIMESTAMP` of the last applied transaction. `-1` = no data (channel idle or not yet configured).
+
+**Recommended alerting rules:**
+```yaml
+- alert: GTIDLagGrowing
+  expr: mysql_keeper_gtid_missing_transactions > 100
+  for: 5m
+  annotations:
+    summary: "Replica is falling behind — {{ $value }} transactions unapplied"
+
+- alert: ReplicationLagHigh
+  expr: mysql_keeper_replication_lag_seconds > 30
+  for: 5m
+  annotations:
+    summary: "Replication lag {{ $value }}s — switchover may be blocked by preflight C6"
+```
 
 ## Supported MySQL versions
 

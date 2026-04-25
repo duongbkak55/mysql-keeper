@@ -98,6 +98,40 @@ services:
       timeout: 5s
       retries: 60
 
+  # ProxySQL instances — one per cluster, each fronting its own PXC.
+  # Admin port 6032 exposed so the controller / switchover-cli can update
+  # routing; client port 6033 is where apps would connect.
+  #
+  # Two admin users are provisioned at init:
+  #   admin  : mặc định, bị ProxySQL lock localhost-only
+  #   keeper : dùng cho mysql-keeper, cho phép kết nối từ bất kỳ đâu
+  # Password = stagingpass (same as MySQL for test simplicity).
+  proxysql-dc:
+    image: proxysql/proxysql:2.7.1
+    container_name: keeper-proxysql-dc
+    restart: unless-stopped
+    depends_on:
+      pxc-dc:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:36032:6032"   # admin
+      - "127.0.0.1:36033:6033"   # client
+    volumes:
+      - ./proxysql-dc.cnf:/etc/proxysql.cnf:ro
+
+  proxysql-dr:
+    image: proxysql/proxysql:2.7.1
+    container_name: keeper-proxysql-dr
+    restart: unless-stopped
+    depends_on:
+      pxc-dr:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:36042:6032"   # admin
+      - "127.0.0.1:36043:6033"   # client
+    volumes:
+      - ./proxysql-dr.cnf:/etc/proxysql.cnf:ro
+
 volumes:
   pxc-dc-data:
   pxc-dr-data:

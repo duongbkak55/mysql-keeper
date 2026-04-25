@@ -41,9 +41,12 @@ if [[ "${wsrep_state}" != "Primary" ]]; then
 fi
 log "DC wsrep_cluster_status=Primary ✓"
 
-log "Creating replication user + smoke-test schema on DC"
+log "Creating replication user + ProxySQL monitor user + smoke-test schema on DC"
 mysql_dc "CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${REPL_PW}'"
 mysql_dc "GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%'"
+# ProxySQL's monitor module needs this account on every PXC node it polls.
+mysql_dc "CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED WITH mysql_native_password BY 'stagingpass'"
+mysql_dc "GRANT USAGE, REPLICATION CLIENT ON *.* TO 'monitor'@'%'"
 mysql_dc "FLUSH PRIVILEGES"
 mysql_dc "CREATE DATABASE IF NOT EXISTS smoketest"
 mysql_dc "CREATE TABLE IF NOT EXISTS smoketest.pings (id BIGINT AUTO_INCREMENT PRIMARY KEY, cluster_id VARCHAR(8) NOT NULL, ts DATETIME(6) NOT NULL DEFAULT NOW(6))"
@@ -81,12 +84,28 @@ if [[ "${io}" != "ON" || "${sql}" != "ON" ]]; then
   exit 1
 fi
 
+log "Waiting for ProxySQL DC+DR admin ports (30s)"
+for svc in keeper-proxysql-dc keeper-proxysql-dr; do
+  for i in $(seq 1 30); do
+    if docker exec "${svc}" mysql -h 127.0.0.1 -P 6032 -uadmin -p"${ROOT_PW}" -Nse "SELECT 1" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+done
+
 log ""
-log "Local PXC staging ready."
+log "Local PXC + ProxySQL staging ready."
 log ""
-log "Host endpoints:"
-log "  DC: 127.0.0.1:33011 (root / ${ROOT_PW})"
-log "  DR: 127.0.0.1:33012 (root / ${ROOT_PW})"
+log "MySQL host endpoints:"
+log "  DC MySQL:        127.0.0.1:33011 (root / ${ROOT_PW})"
+log "  DR MySQL:        127.0.0.1:33012 (root / ${ROOT_PW})"
+log "ProxySQL admin endpoints (note: use 'keeper' user from non-localhost):"
+log "  DC admin:        127.0.0.1:36032 (admin|keeper / ${ROOT_PW})"
+log "  DR admin:        127.0.0.1:36042"
+log "ProxySQL client endpoints (apps connect here):"
+log "  DC client:       127.0.0.1:36033 (root / ${ROOT_PW})"
+log "  DR client:       127.0.0.1:36043"
 log ""
 log "DSNs for the preflight CLI:"
 log "  export DC_DSN='root:${ROOT_PW}@tcp(127.0.0.1:33011)/?parseTime=true'"
@@ -98,4 +117,5 @@ log "  scripts/local/pxc-bug-simulate.sh lag       # inject GTID lag"
 log "  scripts/local/pxc-preflight.sh              # run preflight, expect FAIL (C5/C6)"
 log "  scripts/local/pxc-bug-simulate.sh recover   # resume replication"
 log "  scripts/local/pxc-bug-simulate.sh both-ro   # simulate quorum loss on DC"
+log "  scripts/local/pxc-switchover.sh             # full engine drill (requires ProxySQL)"
 log "  scripts/local/pxc-down.sh                   # tear down"

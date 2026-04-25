@@ -8,6 +8,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -183,6 +185,45 @@ func (m *Manager) WaitForGTID(ctx context.Context, gtid string, timeout time.Dur
 		return fmt.Errorf("replica did not reach target GTID within %s", timeout)
 	}
 	return nil
+}
+
+// CountGTIDTransactions parses a GTID set string and returns the total number
+// of individual transactions it represents. Used to derive a scalar "missing
+// transactions" count from the GTID_SUBTRACT result without needing a DB call.
+//
+// GTID set format: "uuid:N[-M][:P-Q]...[,uuid2:...]" with optional whitespace.
+// A range N-M contributes M-N+1 transactions; a single N contributes 1.
+func CountGTIDTransactions(gtidSet string) int64 {
+	if gtidSet == "" {
+		return 0
+	}
+	var total int64
+	for _, entry := range strings.FieldsFunc(gtidSet, func(r rune) bool { return r == ',' }) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// Split by ':' — first token is the UUID, remaining tokens are intervals.
+		parts := strings.Split(entry, ":")
+		for _, iv := range parts[1:] {
+			iv = strings.TrimSpace(iv)
+			if iv == "" {
+				continue
+			}
+			if dash := strings.IndexByte(iv, '-'); dash >= 0 {
+				lo, e1 := strconv.ParseInt(iv[:dash], 10, 64)
+				hi, e2 := strconv.ParseInt(iv[dash+1:], 10, 64)
+				if e1 == nil && e2 == nil && hi >= lo {
+					total += hi - lo + 1
+				}
+			} else {
+				if _, err := strconv.ParseInt(iv, 10, 64); err == nil {
+					total++ // single transaction number = 1 transaction
+				}
+			}
+		}
+	}
+	return total
 }
 
 // readLogReplicaUpdates prefers the modern variable name and falls back to

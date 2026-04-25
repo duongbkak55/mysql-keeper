@@ -8,8 +8,12 @@ package controller
 import (
 	"context"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
 	"github.com/duongnguyen/mysql-keeper/internal/metrics"
+	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 	"github.com/duongnguyen/mysql-keeper/internal/switchover"
 )
 
@@ -64,4 +68,78 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationMetrics(
 
 	observe(comps.localInspector, "local", localChannel)
 	observe(comps.remoteInspector, "remote", remoteChannel)
+}
+
+// lagQuerier is satisfied by *pxc.Manager. It is intentionally local so we
+// avoid a breaking change to switchover.ReplicationInspector — callers that
+// don't implement it (e.g. mano.PXCManager) simply skip the lag-seconds metric.
+type lagQuerier interface {
+	GetReplicationLagSeconds(ctx context.Context, channel string) (int64, error)
+}
+
+// observeGTIDLag measures the GTID transaction gap between the source (local)
+// and replica (remote) clusters. It exports GTIDMissingTransactions and
+// ReplicationLagSeconds Prometheus metrics and returns the measurement so the
+// caller can persist it on the CR status and fire Warning events.
+//
+// Returns measured=false when prerequisites are absent (no channel name,
+// missing inspectors, or GTID queries fail). This is non-fatal — the caller
+// should skip the status update and event in that case.
+func (r *ClusterSwitchPolicyReconciler) observeGTIDLag(
+	ctx context.Context,
+	policy *mysqlv1alpha1.ClusterSwitchPolicy,
+	comps *componentSet,
+) (missing, lagSec int64, measured bool) {
+	localChannel := policy.Spec.ReplicationChannelName
+	remoteChannel := policy.Spec.PeerReplicationChannelName
+	if remoteChannel == "" {
+		remoteChannel = localChannel
+	}
+	if localChannel == "" || comps.localInspector == nil || comps.remoteInspector == nil {
+		return 0, -1, false
+	}
+
+	logger := ctrl.LoggerFrom(ctx)
+	role := policy.Spec.ClusterRole
+
+	// Step 1: snapshot the source (local) GTID set.
+	localGTID, err := comps.localInspector.GetExecutedGTID(ctx)
+	if err != nil {
+		logger.V(1).Info("gtid lag: GetExecutedGTID on local failed", "err", err)
+		return 0, -1, false
+	}
+
+	// Step 2: compute what the replica is missing.
+	missingSet, err := comps.remoteInspector.MissingGTIDs(ctx, localGTID)
+	if err != nil {
+		logger.V(1).Info("gtid lag: MissingGTIDs on remote failed", "err", err)
+		return 0, -1, false
+	}
+	missing = pxc.CountGTIDTransactions(missingSet)
+	metrics.GTIDMissingTransactions.WithLabelValues(role).Set(float64(missing))
+
+	// Step 3: replication lag in seconds — only available when the remote
+	// inspector is *pxc.Manager (direct MySQL), not via MANO.
+	lagSec = -1
+	if lq, ok := comps.remoteInspector.(lagQuerier); ok {
+		if s, err := lq.GetReplicationLagSeconds(ctx, remoteChannel); err == nil {
+			lagSec = s
+		} else {
+			logger.V(1).Info("gtid lag: GetReplicationLagSeconds failed", "err", err)
+		}
+	}
+	if lagSec >= 0 {
+		metrics.ReplicationLagSeconds.WithLabelValues(role, remoteChannel).Set(float64(lagSec))
+	}
+
+	return missing, lagSec, true
+}
+
+// gtidLagStatusFor builds the GTIDLagStatus value to persist on the CR.
+func gtidLagStatusFor(missing, lagSec int64) *mysqlv1alpha1.GTIDLagStatus {
+	return &mysqlv1alpha1.GTIDLagStatus{
+		MissingTransactions: missing,
+		LagSeconds:          lagSec,
+		MeasuredAt:          metav1.Now(),
+	}
 }

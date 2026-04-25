@@ -2,7 +2,9 @@
 ## Requires: go, docker, kubectl, kustomize, controller-gen
 
 # Image settings — override via environment variables.
-IMG ?= ghcr.io/duongnguyen/mysql-keeper:latest
+IMG            ?= ghcr.io/duongnguyen/mysql-keeper:latest
+DOCKERHUB_IMG  ?= duongbkak55/mysql-keeper
+VERSION        ?= 0.3.0
 CONTROLLER_GEN_VERSION ?= v0.14.0
 KUSTOMIZE_VERSION ?= v5.3.0
 
@@ -46,6 +48,17 @@ docker-build: ## Build and tag the controller Docker image.
 
 docker-push: ## Push the controller Docker image to the registry.
 	docker push $(IMG)
+
+docker-buildx-push: ## Build multi-arch image (amd64+arm64) and push to Docker Hub.
+	docker buildx build \
+		--platform linux/amd64,linux/arm64 \
+		--label "org.opencontainers.image.source=https://github.com/duongbkak55/mysql-keeper" \
+		--label "org.opencontainers.image.revision=$$(git rev-parse HEAD)" \
+		--label "org.opencontainers.image.title=mysql-keeper" \
+		--label "org.opencontainers.image.version=$(VERSION)" \
+		-t $(DOCKERHUB_IMG):$(VERSION) \
+		-t $(DOCKERHUB_IMG):latest \
+		--push .
 
 ## ── CRD Install/Uninstall ────────────────────────────────────────────────────
 

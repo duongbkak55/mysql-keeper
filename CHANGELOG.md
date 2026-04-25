@@ -4,6 +4,85 @@ All notable changes to `mysql-keeper` are documented in this file. Dates are
 ISO-8601. Releases follow semantic versioning for the external CRD API; the
 internal Go packages may change without notice between releases.
 
+## [0.3.0] — 2026-04-25 — GTID lag monitoring + dynamic ProxySQL discovery
+
+### Added
+
+- **Continuous GTID lag monitoring** — every reconcile now measures the gap
+  between source and replica without waiting for a switchover attempt:
+  - `mysql_keeper_gtid_missing_transactions{cluster_role}` — count of
+    transactions present on the source but not yet applied by the replica
+    (`GTID_SUBTRACT` scalar). Alert on this before preflight C5/C6 ever block
+    a flip.
+  - `mysql_keeper_replication_lag_seconds{cluster_role,channel}` — estimated
+    lag derived from `ORIGINAL_COMMIT_TIMESTAMP` of the last applied
+    transaction on the replica. `-1` when no data is available (channel idle
+    or not yet configured).
+  - `status.gtidLag` on the `ClusterSwitchPolicy` CR — updated every reconcile,
+    visible via `kubectl describe` without Prometheus.
+  - `spec.healthCheck.gtidLagAlertThresholdTransactions` — when positive, the
+    controller emits a `Warning / GTIDLagHigh` Kubernetes event on the CR
+    whenever the missing-transaction count exceeds this value. Provides an
+    early on-call signal before replication lag grows to a point where a
+    switchover would be blocked.
+  - `internal/pxc.CountGTIDTransactions(string) int64` — pure GTID set parser;
+    tested with 10 cases (ranges, singles, multi-UUID, MySQL newlines).
+  - `(*Manager).GetReplicationLagSeconds(ctx, channel)` — queries
+    `performance_schema.replication_applier_status_by_coordinator` joined
+    with `replication_connection_status`; falls back to connection-status only
+    for older schema variants.
+
+- **`proxySQLSelector` — dynamic ProxySQL pod discovery** for
+  Deployment-based ProxySQL instances whose pod IPs change on healing:
+  - New `spec.proxySQLSelector` field on `ClusterSwitchPolicy` replaces the
+    static `spec.proxySQL` list.  The controller lists pods by namespace +
+    label selector at every reconcile, filters to Running+Ready+IP pods, and
+    builds fresh endpoint slices — endpoints are always current after pod
+    restarts or IP changes.
+  - `spec.proxySQL` is now optional (omitempty); an error is returned if
+    neither field is set.
+  - RBAC updated: `pods get/list/watch` permission added.
+  - CRD schema updated with `proxySQLSelector` object; `proxySQL` removed from
+    `required`.
+  - Sample CR (`config/samples/clusterswitchpolicy_dc.yaml`) updated —
+    `proxySQLSelector` is now the default (Option A); static list is Option B
+    (commented).
+  - Unit tests in `internal/controller/proxysql_selector_test.go` using
+    `controller-runtime/pkg/client/fake`: Running+Ready pods returned,
+    Pending/not-Ready/no-IP/wrong-label excluded, zero-match no error, default
+    port, both-nil error, selector routing.
+
+- **Tier B integration tests** (real containers, `//go:build integration`):
+  - `internal/proxysql/integration_test.go` — 3 tests with real ProxySQL
+    2.7.1: `ApplyFailoverRouting`, `RollbackRouting`, blackhole fence on HG 9999.
+  - `internal/pxc/gtid_integration_test.go` — 3 tests with real MySQL 8.0.39:
+    GTID snapshot, `IsGTIDSubset`, `WaitForGTID`.  Fixed `ForAll` +
+    ping-retry startup to avoid "driver: bad connection" on auth-plugin init.
+  - `internal/mano/pxc_manager_integration_test.go` — 3 tests with real
+    MySQL + mock MANO HTTP server: write-probe catches operator lag, happy
+    path verifies `isSource=true`, `SetReadOnly` does not modify MySQL
+    `@@read_only`.
+
+### Changed
+
+- `observeReplicationMetrics` now also computes GTID lag and calls the new
+  `observeGTIDLag` helper; the `Recorder` field on the reconciler is populated
+  from `mgr.GetEventRecorderFor("mysql-keeper-controller")`.
+- The `lagQuerier` interface is local to `replication_metrics.go`, allowing
+  `*pxc.Manager` to satisfy it without a breaking change to
+  `switchover.ReplicationInspector` — `mano.PXCManager` silently skips the
+  lag-seconds metric.
+
+### Upgrade notes
+
+- Re-apply the CRD (`config/crd/`) to pick up `proxySQLSelector` and
+  `status.gtidLag`.
+- Existing CRs that use `spec.proxySQL` continue to work unchanged.
+- Set `spec.healthCheck.gtidLagAlertThresholdTransactions` to a positive
+  integer (e.g. `100`) to enable early Warning events for your SLO.
+
+---
+
 ## [0.2.0] — 2026-04-23 — production-readiness remediation
 
 This is a **mandatory upgrade** for anyone running `autoFailover=true`. The

@@ -54,6 +54,8 @@ type BlackholeConfig struct {
 type Manager struct {
 	endpoints []Endpoint
 	timeout   time.Duration
+	// openDB is nil in production; tests inject it to avoid real TCP dials.
+	openDB func(ep Endpoint) (*sql.DB, error)
 }
 
 // NewManager creates a ProxySQL Manager for the given set of admin endpoints.
@@ -190,14 +192,11 @@ func (m *Manager) Blackhole(ctx context.Context, cfg BlackholeConfig) error {
 }
 
 func (m *Manager) blackholeOne(ctx context.Context, ep Endpoint, host string, port, hg int32) error {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/", ep.Username, ep.Password, ep.Host, ep.Port)
-	db, err := sql.Open("mysql", dsn)
+	db, err := m.dial(ep)
 	if err != nil {
 		return fmt.Errorf("open admin: %w", err)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	db.SetConnMaxLifetime(m.timeout)
 	return m.runBlackholeSteps(ctx, db, host, port, hg)
 }
 
@@ -222,13 +221,12 @@ func (m *Manager) runBlackholeSteps(ctx context.Context, db *sql.DB, host string
 		return fmt.Errorf("update mysql_servers: %w", err)
 	}
 
+	// SQLite-flavoured upsert — see the ProxySQL admin dialect note on
+	// runPrepareSteps. Plain ON DUPLICATE KEY UPDATE is not accepted.
 	if _, err := db.ExecContext(qCtx, `
-		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
+		INSERT OR REPLACE INTO mysql_servers
+			(hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'OFFLINE_HARD', 0, 0)
-		ON DUPLICATE KEY UPDATE
-			hostgroup_id = VALUES(hostgroup_id),
-			status = 'OFFLINE_HARD',
-			max_connections = 0
 	`, hg, host, port); err != nil {
 		return fmt.Errorf("insert blackhole row: %w", err)
 	}
@@ -242,19 +240,29 @@ func (m *Manager) runBlackholeSteps(ctx context.Context, db *sql.DB, host string
 	return nil
 }
 
-// prepareOne stages the routing change on a single ProxySQL instance without
-// calling LOAD SERVERS. It returns an open *sql.DB so commitOne can finish
-// the change on the same session; the caller is responsible for Close.
-func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/", ep.Username, ep.Password, ep.Host, ep.Port)
-
+// dial opens an admin connection to ep, honouring the openDB override if set.
+func (m *Manager) dial(ep Endpoint) (*sql.DB, error) {
+	if m.openDB != nil {
+		return m.openDB(ep)
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?interpolateParams=true", ep.Username, ep.Password, ep.Host, ep.Port)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open admin connection: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(m.timeout)
+	return db, nil
+}
 
+// prepareOne stages the routing change on a single ProxySQL instance without
+// calling LOAD SERVERS. It returns an open *sql.DB so commitOne can finish
+// the change on the same session; the caller is responsible for Close.
+func (m *Manager) prepareOne(ctx context.Context, ep Endpoint, cfg RoutingConfig) (*sql.DB, error) {
+	db, err := m.dial(ep)
+	if err != nil {
+		return nil, err
+	}
 	if err := m.runPrepareSteps(ctx, db, cfg); err != nil {
 		return db, err
 	}
@@ -271,32 +279,40 @@ func (m *Manager) runPrepareSteps(ctx context.Context, db *sql.DB, cfg RoutingCo
 		return fmt.Errorf("ping: %w", err)
 	}
 
+	// Remove the old writer from the WRITE hostgroup. We can't UPDATE the
+	// row's hostgroup_id to the read HG because the read HG usually
+	// already has an entry for the same host/port (common pattern:
+	// app reads from the primary when latency matters), which would
+	// collide on ProxySQL's primary key (hostgroup_id, hostname, port).
+	// DELETE leaves the existing read-HG row intact.
+	//
+	// If the old writer also lives in the read HG (typical), operators
+	// can decide per-policy whether to drain it before the flip — our
+	// default is to keep it serving reads until it is fenced and
+	// replication reverses.
 	if _, err := db.ExecContext(qCtx, `
-		UPDATE mysql_servers
-		SET hostgroup_id = ?, max_connections = 0
-		WHERE hostname = ? AND port = ?
-	`, cfg.ReadOnlyHostgroup, cfg.OldWriterHost, cfg.OldWriterPort); err != nil {
+		DELETE FROM mysql_servers
+		WHERE hostgroup_id = ? AND hostname = ? AND port = ?
+	`, cfg.ReadWriteHostgroup, cfg.OldWriterHost, cfg.OldWriterPort); err != nil {
 		return fmt.Errorf("demote old writer: %w", err)
 	}
 
+	// ProxySQL's admin interface is SQLite-backed, not MySQL — it does
+	// NOT support "ON DUPLICATE KEY UPDATE". The SQLite equivalent is
+	// "INSERT OR REPLACE" which performs an upsert on the primary key
+	// (hostgroup_id, hostname, port).
 	if _, err := db.ExecContext(qCtx, `
-		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
+		INSERT OR REPLACE INTO mysql_servers
+			(hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
-		ON DUPLICATE KEY UPDATE
-			hostgroup_id    = VALUES(hostgroup_id),
-			status          = 'ONLINE',
-			max_connections = 1000,
-			weight          = 1
 	`, cfg.ReadWriteHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
 		return fmt.Errorf("promote new writer: %w", err)
 	}
 
 	if _, err := db.ExecContext(qCtx, `
-		INSERT INTO mysql_servers (hostgroup_id, hostname, port, status, max_connections, weight)
+		INSERT OR REPLACE INTO mysql_servers
+			(hostgroup_id, hostname, port, status, max_connections, weight)
 		VALUES (?, ?, ?, 'ONLINE', 1000, 1)
-		ON DUPLICATE KEY UPDATE
-			status          = 'ONLINE',
-			max_connections = 1000
 	`, cfg.ReadOnlyHostgroup, cfg.NewWriterHost, cfg.NewWriterPort); err != nil {
 		return fmt.Errorf("add new writer to RO group: %w", err)
 	}
