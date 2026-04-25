@@ -2,6 +2,7 @@
 
 | Scenario                                           | Runbook                                         | Severity         |
 | -------------------------------------------------- | ----------------------------------------------- | ---------------- |
+| **Master incident response & recovery (start here)** | [incident-response-playbook.md](incident-response-playbook.md) | all severities |
 | Switchover stuck in `SwitchingOver`                | [switchover-stuck.md](switchover-stuck.md)      | warning/critical |
 | Both clusters writable at the same time            | [split-brain-recovery.md](split-brain-recovery.md) | critical (page)  |
 | Planned DR drill (quarterly / post-upgrade)        | [dr-drill.md](dr-drill.md)                      | informational    |
