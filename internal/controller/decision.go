@@ -68,6 +68,39 @@ func EvaluateSwitchover(
 			Reason: "autoFailover disabled and no manual trigger set",
 		}
 	}
+
+	// 3a. Remote-sustained-unreachable path.
+	// Separate from the local-failure path below: here the LOCAL cluster is
+	// healthy (it is the passive DR replica) and the REMOTE (active DC) has
+	// gone dark at the TCP level for enough consecutive cycles to justify
+	// assuming it is dead, not just temporarily partitioned.
+	//
+	// Requires AllowDataLossFailover=true because the remote cannot be queried
+	// for GTID verification (preflight C5/C6 would be impossible to run).
+	remoteUnreachThreshold := policy.Spec.HealthCheck.RemoteUnreachableThreshold
+	if remoteUnreachThreshold > 0 {
+		if policy.Status.ConsecutiveRemoteUnreachable >= remoteUnreachThreshold {
+			if !policy.Spec.AllowDataLossFailover {
+				return SwitchoverDecision{
+					Should: false,
+					Reason: fmt.Sprintf(
+						"remote unreachable for %d consecutive checks (threshold=%d) but AllowDataLossFailover=false — enable it to allow auto-promotion without GTID verification",
+						policy.Status.ConsecutiveRemoteUnreachable, remoteUnreachThreshold,
+					),
+					Blocker: "remote_unreachable_dataloss_guard",
+				}
+			}
+			return SwitchoverDecision{
+				Should: true,
+				Reason: fmt.Sprintf(
+					"automatic failover: remote sustained-unreachable for %d consecutive checks (threshold=%d)",
+					policy.Status.ConsecutiveRemoteUnreachable, remoteUnreachThreshold,
+				),
+			}
+		}
+	}
+
+	// 3b. Local-failure path.
 	// Failover triggers on EITHER counter hitting the threshold:
 	//   - ConsecutiveLocalFailures: MySQL reachable but reporting bad state
 	//     (wsrep non-Primary, quorum lost, etc.)

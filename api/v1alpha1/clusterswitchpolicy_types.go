@@ -291,6 +291,25 @@ type HealthCheckConfig struct {
 	// +kubebuilder:default=0
 	// +optional
 	GTIDLagAlertThresholdTransactions int64 `json:"gtidLagAlertThresholdTransactions,omitempty"`
+
+	// RemoteUnreachableThreshold, when positive, enables an additional
+	// auto-promotion path: if the remote cluster has been TCP-unreachable for
+	// this many consecutive health-check cycles the controller promotes the
+	// local cluster to active.
+	//
+	// This path is INDEPENDENT of FailureThreshold (which triggers on LOCAL
+	// failure). Use it to let the passive DR site take over when the active DC
+	// disappears entirely — e.g. DC k8s + MySQL both down.
+	//
+	// IMPORTANT: AllowDataLossFailover must also be true. Because the remote
+	// cannot be queried, GTID subset verification (preflight C5/C6) is
+	// impossible. Set this threshold only after accepting that risk.
+	//
+	// Example: interval=15s, threshold=10 → promote after ~2.5 min of silence.
+	// 0 (default) disables this path entirely.
+	// +kubebuilder:default=0
+	// +optional
+	RemoteUnreachableThreshold int32 `json:"remoteUnreachableThreshold,omitempty"`
 }
 
 // SwitchoverConfig defines switchover behavior and ProxySQL hostgroup IDs.
@@ -381,6 +400,13 @@ type ClusterSwitchPolicyStatus struct {
 	// separately so operators can alert on this independently.
 	// +optional
 	ConsecutiveLocalUnreachable int32 `json:"consecutiveLocalUnreachable,omitempty"`
+
+	// ConsecutiveRemoteUnreachable counts how many successive health check
+	// cycles were unable to reach the remote cluster at all (TCP-level failure).
+	// When this counter reaches spec.healthCheck.remoteUnreachableThreshold and
+	// AllowDataLossFailover=true, the controller promotes the local cluster.
+	// +optional
+	ConsecutiveRemoteUnreachable int32 `json:"consecutiveRemoteUnreachable,omitempty"`
 
 	// LastSwitchoverTime is when the last successful switchover completed.
 	// +optional

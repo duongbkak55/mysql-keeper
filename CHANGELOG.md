@@ -4,6 +4,53 @@ All notable changes to `mysql-keeper` are documented in this file. Dates are
 ISO-8601. Releases follow semantic versioning for the external CRD API; the
 internal Go packages may change without notice between releases.
 
+## [0.4.0] — 2026-04-25 — Remote-unreachable auto-failover
+
+### Added
+
+- **`spec.healthCheck.remoteUnreachableThreshold`** — new auto-failover path
+  for the "active DC goes completely dark" scenario that was previously
+  unhandled by the local-failure path:
+  - When the remote cluster has been TCP-unreachable for this many
+    consecutive health-check cycles, the controller promotes the local
+    cluster to active. Example: `threshold=10`, `interval=15s` → promote
+    after ~2.5 minutes of silence from DC.
+  - Requires `allowDataLossFailover: true` because `GTID_SUBSET` preflight
+    (C5/C6) cannot run when the remote is unreachable.
+  - 0 (default) disables the path entirely — no change for existing CRs.
+  - Blocked with `blocker: remote_unreachable_dataloss_guard` when threshold
+    is reached but `allowDataLossFailover=false`, surfaced in CR events and
+    `status.lastPreFlight`.
+
+- **`status.consecutiveRemoteUnreachable`** — counter visible via
+  `kubectl describe`, increments on TCP-level remote failure
+  (`WritableUnknown`), resets when remote becomes healthy or reachable-but-
+  unhealthy, and is zeroed on switchover success.
+
+- **Prometheus metric** `mysql_keeper_consecutive_failures{scope="remote_unreachable"}`
+  — alertable gauge for the new counter. Also added
+  `{scope="local_unreachable"}` (was tracked internally but not exported).
+
+- **Decision unit tests** — 3 new cases:
+  `TestDecide_RemoteUnreachableThresholdDisabled`,
+  `TestDecide_RemoteUnreachableBlockedWithoutDataLoss`,
+  `TestDecide_RemoteUnreachableHappyPath`.
+
+- **Runbook** `docs/runbooks/remote-unreachable-failover.md` — full design
+  rationale, counter lifecycle, threshold guidance, network-partition risk
+  analysis, post-recovery manual steps, and Prometheus alert rule.
+
+### Upgrade notes
+
+- Re-apply the CRD (`config/crd/`) to pick up `remoteUnreachableThreshold`
+  and `consecutiveRemoteUnreachable`.
+- Existing CRs with neither field set behave identically to 0.3.0 — the
+  new path is opt-in.
+- To enable: set `remoteUnreachableThreshold` to a positive integer AND
+  `allowDataLossFailover: true` on the passive (DR) CR only.
+
+---
+
 ## [0.3.0] — 2026-04-25 — GTID lag monitoring + dynamic ProxySQL discovery
 
 ### Added

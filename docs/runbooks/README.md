@@ -8,6 +8,7 @@
 | Chaos drills (D1–D5) on staging                    | [chaos-drills.md](chaos-drills.md)              | informational    |
 | Go-live DR drill plan (master checklist)           | [go-live-drill-plan.md](go-live-drill-plan.md)  | release gate     |
 | GTID lag monitoring — flow, metrics, alerts        | [gtid-lag-monitoring.md](gtid-lag-monitoring.md) | reference        |
+| Remote-unreachable auto-failover — config & risks  | [remote-unreachable-failover.md](remote-unreachable-failover.md) | reference |
 
 ## When to disable `autoFailover`
 

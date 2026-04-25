@@ -160,6 +160,67 @@ func TestDecide_AutoFailoverDisabled(t *testing.T) {
 	}
 }
 
+// TestDecide_RemoteUnreachableThresholdDisabled — when threshold=0 (default)
+// the feature is off even if the remote has been dark for many cycles.
+func TestDecide_RemoteUnreachableThresholdDisabled(t *testing.T) {
+	p := newPolicy()
+	// threshold not set (0) — feature disabled
+	p.Status.ConsecutiveRemoteUnreachable = 100
+	p.Spec.AllowDataLossFailover = true
+
+	d := EvaluateSwitchover(p,
+		health.ClusterHealth{Writable: health.WritableNo, Healthy: true},
+		health.ClusterHealth{Writable: health.WritableUnknown, Healthy: false,
+			Message: "dial tcp: connection refused"},
+		time.Now(),
+	)
+	if d.Should {
+		t.Fatalf("expected no trigger when remoteUnreachableThreshold=0; got: %s", d.Reason)
+	}
+}
+
+// TestDecide_RemoteUnreachableBlockedWithoutDataLoss — threshold reached but
+// AllowDataLossFailover=false must block with the correct blocker label.
+func TestDecide_RemoteUnreachableBlockedWithoutDataLoss(t *testing.T) {
+	p := newPolicy()
+	p.Spec.HealthCheck.RemoteUnreachableThreshold = 5
+	p.Spec.AllowDataLossFailover = false
+	p.Status.ConsecutiveRemoteUnreachable = 5
+
+	d := EvaluateSwitchover(p,
+		health.ClusterHealth{Writable: health.WritableNo, Healthy: true},
+		health.ClusterHealth{Writable: health.WritableUnknown, Healthy: false},
+		time.Now(),
+	)
+	if d.Should {
+		t.Fatalf("expected data-loss guard to block; got: %s", d.Reason)
+	}
+	if d.Blocker != "remote_unreachable_dataloss_guard" {
+		t.Errorf("expected Blocker=remote_unreachable_dataloss_guard, got %q", d.Blocker)
+	}
+}
+
+// TestDecide_RemoteUnreachableHappyPath — threshold reached AND
+// AllowDataLossFailover=true → controller must promote.
+func TestDecide_RemoteUnreachableHappyPath(t *testing.T) {
+	p := newPolicy()
+	p.Spec.HealthCheck.RemoteUnreachableThreshold = 5
+	p.Spec.AllowDataLossFailover = true
+	p.Status.ConsecutiveRemoteUnreachable = 5
+
+	d := EvaluateSwitchover(p,
+		health.ClusterHealth{Writable: health.WritableNo, Healthy: true},
+		health.ClusterHealth{Writable: health.WritableUnknown, Healthy: false},
+		time.Now(),
+	)
+	if !d.Should {
+		t.Fatalf("expected auto-promotion on sustained remote-unreachable; got: %s (blocker=%s)", d.Reason, d.Blocker)
+	}
+	if !containsString(d.Reason, "remote sustained-unreachable") {
+		t.Errorf("expected reason to mention 'remote sustained-unreachable'; got: %s", d.Reason)
+	}
+}
+
 // --- helpers --------------------------------------------------------------
 
 func newPolicy() *mysqlv1alpha1.ClusterSwitchPolicy {

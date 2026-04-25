@@ -459,6 +459,7 @@ func (r *ClusterSwitchPolicyReconciler) writeSwitchoverResult(
 		policy.Status.Phase = mysqlv1alpha1.PhaseMonitoring
 		policy.Status.ConsecutiveLocalFailures = 0
 		policy.Status.ConsecutiveLocalUnreachable = 0
+		policy.Status.ConsecutiveRemoteUnreachable = 0
 
 		if policy.Status.ActiveCluster == mysqlv1alpha1.ClusterRoleDC {
 			policy.Status.ActiveCluster = mysqlv1alpha1.ClusterRoleDR
@@ -625,10 +626,17 @@ func (r *ClusterSwitchPolicyReconciler) updateHealthStatus(
 		policy.Status.ConsecutiveLocalFailures++
 	}
 
-	if remoteH.Healthy {
+	switch {
+	case remoteH.Healthy:
 		policy.Status.ConsecutiveRemoteFailures = 0
-	} else {
+		policy.Status.ConsecutiveRemoteUnreachable = 0
+	case remoteH.Writable == health.WritableUnknown:
+		// TCP-level unreachable: drives the remoteUnreachableThreshold gate.
+		policy.Status.ConsecutiveRemoteUnreachable++
+	default:
+		// Reachable but unhealthy (replication broken, quorum lost, etc.)
 		policy.Status.ConsecutiveRemoteFailures++
+		policy.Status.ConsecutiveRemoteUnreachable = 0
 	}
 
 	if policy.Status.ActiveCluster == "" {
@@ -697,8 +705,14 @@ func (r *ClusterSwitchPolicyReconciler) updateMetrics(
 	metrics.ConsecutiveFailures.WithLabelValues(role, "local").Set(
 		float64(policy.Status.ConsecutiveLocalFailures),
 	)
+	metrics.ConsecutiveFailures.WithLabelValues(role, "local_unreachable").Set(
+		float64(policy.Status.ConsecutiveLocalUnreachable),
+	)
 	metrics.ConsecutiveFailures.WithLabelValues(role, "remote").Set(
 		float64(policy.Status.ConsecutiveRemoteFailures),
+	)
+	metrics.ConsecutiveFailures.WithLabelValues(role, "remote_unreachable").Set(
+		float64(policy.Status.ConsecutiveRemoteUnreachable),
 	)
 
 	metrics.ProxySQLHealthyInstances.WithLabelValues(role).Set(float64(localH.ProxySQLHealthy))
