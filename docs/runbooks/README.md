@@ -7,6 +7,7 @@
 | Planned DR drill (quarterly / post-upgrade)        | [dr-drill.md](dr-drill.md)                      | informational    |
 | Chaos drills (D1–D5) on staging                    | [chaos-drills.md](chaos-drills.md)              | informational    |
 | Go-live DR drill plan (master checklist)           | [go-live-drill-plan.md](go-live-drill-plan.md)  | release gate     |
+| GTID lag monitoring — flow, metrics, alerts        | [gtid-lag-monitoring.md](gtid-lag-monitoring.md) | reference        |
 
 ## When to disable `autoFailover`
 
