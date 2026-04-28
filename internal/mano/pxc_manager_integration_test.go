@@ -113,7 +113,7 @@ func TestPXCManagerIntegration_SetReadWrite_WriteProbeCatchesOperatorLag(t *test
 
 	mock := newMockMANO(t) // always returns operationState=COMPLETED
 	mgr := mano.NewPXCManager(
-		mano.NewClient(mock.srv.URL, "mock-token"),
+		mano.NewClient(mock.srv.URL, "mock-token", false),
 		"cnf-dc", "vdu-pxc",
 		10*time.Millisecond, 5*time.Second,
 		dsn, 10*time.Second,
@@ -138,7 +138,7 @@ func TestPXCManagerIntegration_SetReadWrite_HappyPath(t *testing.T) {
 
 	mock := newMockMANO(t)
 	mgr := mano.NewPXCManager(
-		mano.NewClient(mock.srv.URL, "mock-token"),
+		mano.NewClient(mock.srv.URL, "mock-token", false),
 		"cnf-dc", "vdu-pxc",
 		10*time.Millisecond, 5*time.Second,
 		dsn, 10*time.Second,
@@ -162,7 +162,7 @@ func TestPXCManagerIntegration_SetReadOnly_OnlyCallsMANO(t *testing.T) {
 
 	mock := newMockMANO(t)
 	mgr := mano.NewPXCManager(
-		mano.NewClient(mock.srv.URL, "mock-token"),
+		mano.NewClient(mock.srv.URL, "mock-token", false),
 		"cnf-dc", "vdu-pxc",
 		10*time.Millisecond, 5*time.Second,
 		dsn, 10*time.Second,

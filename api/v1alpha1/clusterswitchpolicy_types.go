@@ -169,6 +169,14 @@ type MANOConfig struct {
 	// +kubebuilder:default="5m"
 	// +optional
 	PollTimeout metav1.Duration `json:"pollTimeout,omitempty"`
+
+	// TLSInsecureSkipVerify disables TLS certificate verification when
+	// connecting to the MANO API. Set to true when the MANO server is
+	// addressed by IP only and its certificate has no IP SANs.
+	// Do NOT use in production environments where the MANO endpoint is
+	// reachable from untrusted networks.
+	// +optional
+	TLSInsecureSkipVerify bool `json:"tlsInsecureSkipVerify,omitempty"`
 }
 
 // RemoteKubeAPIConfig holds credentials to reach the remote cluster's k8s API server.

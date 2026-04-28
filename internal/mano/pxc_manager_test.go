@@ -40,7 +40,7 @@ func (s *stubSQL) VerifyWrite(_ context.Context) error                  { return
 // access trick — here we use the exported NewPXCManagerForTest).
 func newTestManager(t *testing.T, mock *mockMANO, sql *stubSQL) *mano.PXCManager {
 	t.Helper()
-	client := mano.NewClient(mock.srv.URL, "test-token")
+	client := mano.NewClient(mock.srv.URL, "test-token", false)
 	return mano.NewPXCManagerForTest(client, "cnf-dc", "vdu-pxc",
 		10*time.Millisecond, 5*time.Second, sql)
 }

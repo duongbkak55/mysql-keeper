@@ -200,6 +200,14 @@ spec:
                     description: PollTimeout is the maximum time to wait for a MANO
                       LCM operation to complete.
                     type: string
+                  tlsInsecureSkipVerify:
+                    description: |-
+                      TLSInsecureSkipVerify disables TLS certificate verification when
+                      connecting to the MANO API. Set to true when the MANO server is
+                      addressed by IP only and its certificate has no IP SANs.
+                      Do NOT use in production environments where the MANO endpoint is
+                      reachable from untrusted networks.
+                    type: boolean
                   remoteCnfName:
                     description: RemoteCNFName is the CNF name of the remote PerconaXtraDBCluster
                       in MANO.

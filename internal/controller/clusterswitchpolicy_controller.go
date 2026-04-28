@@ -840,14 +840,14 @@ func (r *ClusterSwitchPolicyReconciler) buildMANOClient(ctx context.Context, cfg
 		if err != nil {
 			return nil, fmt.Errorf("read MANO credentials: %w", err)
 		}
-		return mano.NewClientWithCredentials(cfg.Host, username, password), nil
+		return mano.NewClientWithCredentials(cfg.Host, username, password, cfg.TLSInsecureSkipVerify), nil
 	}
 	if cfg.TokenSecretRef != nil {
 		token, err := r.readSecretKey(ctx, *cfg.TokenSecretRef, "token")
 		if err != nil {
 			return nil, fmt.Errorf("read MANO token: %w", err)
 		}
-		return mano.NewClient(cfg.Host, token), nil
+		return mano.NewClient(cfg.Host, token, cfg.TLSInsecureSkipVerify), nil
 	}
 	return nil, fmt.Errorf("MANO config requires either tokenSecretRef or credentialsSecretRef")
 }

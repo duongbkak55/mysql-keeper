@@ -12,6 +12,7 @@ package mano
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -43,25 +44,40 @@ type Client struct {
 	tokenExpiry time.Time
 }
 
+// newHTTPClient builds an http.Client. When tlsInsecure is true the TLS
+// certificate verification is disabled — use only when the MANO server is
+// addressed by IP and its certificate carries no IP SANs.
+func newHTTPClient(tlsInsecure bool) *http.Client {
+	if !tlsInsecure {
+		return &http.Client{Timeout: 30 * time.Second}
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // operator opt-in via tlsInsecureSkipVerify
+		},
+	}
+}
+
 // NewClient creates a MANO API client using a pre-obtained static Bearer token.
 // The token is used as-is for every request without refresh.
-func NewClient(baseURL, token string) *Client {
+func NewClient(baseURL, token string, tlsInsecure bool) *Client {
 	return &Client{
 		baseURL:     baseURL,
 		staticToken: token,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		httpClient:  newHTTPClient(tlsInsecure),
 	}
 }
 
 // NewClientWithCredentials creates a MANO API client that auto-obtains and
 // refreshes Bearer tokens via POST /users/auth using Basic auth.
 // username and password are the MANO user credentials.
-func NewClientWithCredentials(baseURL, username, password string) *Client {
+func NewClientWithCredentials(baseURL, username, password string, tlsInsecure bool) *Client {
 	return &Client{
 		baseURL:    baseURL,
 		username:   username,
 		password:   password,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: newHTTPClient(tlsInsecure),
 	}
 }
 

@@ -120,7 +120,7 @@ func (m *mockMANO) handlePoll(w http.ResponseWriter, _ *http.Request) {
 
 func TestClientSetIsSource_HappyPath(t *testing.T) {
 	mock := newMockMANO(t)
-	client := mano.NewClient(mock.srv.URL, "mock-bearer-token")
+	client := mano.NewClient(mock.srv.URL, "mock-bearer-token", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err != nil {
@@ -142,7 +142,7 @@ func TestClientSetIsSource_HappyPath(t *testing.T) {
 
 func TestClientSetIsSource_SetTrue(t *testing.T) {
 	mock := newMockMANO(t)
-	client := mano.NewClient(mock.srv.URL, "mock-bearer-token")
+	client := mano.NewClient(mock.srv.URL, "mock-bearer-token", false)
 
 	if err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", true, 10*time.Millisecond, 5*time.Second); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -155,7 +155,7 @@ func TestClientSetIsSource_SetTrue(t *testing.T) {
 func TestClientSetIsSource_CredentialsMode(t *testing.T) {
 	mock := newMockMANO(t)
 	// Use credentials mode — client must call /users/auth first.
-	client := mano.NewClientWithCredentials(mock.srv.URL, "keeper", "pass")
+	client := mano.NewClientWithCredentials(mock.srv.URL, "keeper", "pass", false)
 
 	if err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -169,7 +169,7 @@ func TestClientSetIsSource_LcmOpFailed(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.opState = "FAILED"
 	mock.opErrorDetail = "PXC operator timeout"
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -180,7 +180,7 @@ func TestClientSetIsSource_LcmOpFailed(t *testing.T) {
 func TestClientSetIsSource_Non202Response(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.updateStatus = http.StatusInternalServerError
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -192,7 +192,7 @@ func TestClientSetIsSource_ContextCancelled(t *testing.T) {
 	// slow mock: never reaches COMPLETED during context window
 	slow := newMockMANO(t)
 	slow.opState = "PROCESSING"
-	client := mano.NewClient(slow.srv.URL, "tok")
+	client := mano.NewClient(slow.srv.URL, "tok", false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -210,7 +210,7 @@ func TestClientSetIsSource_ContextCancelled(t *testing.T) {
 // duplicate login request.
 func TestClientEnsureToken_ConcurrentFirstCall(t *testing.T) {
 	mock := newMockMANO(t)
-	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass")
+	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass", false)
 
 	const goroutines = 5
 	errs := make(chan error, goroutines)
@@ -236,7 +236,7 @@ func TestClientEnsureToken_ConcurrentFirstCall(t *testing.T) {
 func TestClientSetIsSource_MissingLcmOpOccIdHeader(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.missingLcmHeader = true
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -250,7 +250,7 @@ func TestClientSetIsSource_PollLcmOpOcc_FAILED_TEMP(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.opState = "FAILED_TEMP"
 	mock.opErrorDetail = "operator reconcile timed out (transient)"
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -263,7 +263,7 @@ func TestClientSetIsSource_PollLcmOpOcc_FAILED_TEMP(t *testing.T) {
 func TestClientSetIsSource_PollLcmOpOcc_ROLLED_BACK(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.opState = "ROLLED_BACK"
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -277,7 +277,7 @@ func TestClientSetIsSource_PollLcmOpOcc_ROLLED_BACK(t *testing.T) {
 func TestClientSetIsSource_PollTimeout(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.opState = "PROCESSING" // never reaches COMPLETED
-	client := mano.NewClient(mock.srv.URL, "tok")
+	client := mano.NewClient(mock.srv.URL, "tok", false)
 
 	// Small poll interval + tight timeout: deadline fires after a few iterations.
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false,
@@ -295,7 +295,7 @@ func TestClientSetIsSource_PollTimeout(t *testing.T) {
 func TestClientLogin_Non200ReturnsError(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.authStatus = http.StatusUnauthorized
-	client := mano.NewClientWithCredentials(mock.srv.URL, "bad-user", "wrong-pass")
+	client := mano.NewClientWithCredentials(mock.srv.URL, "bad-user", "wrong-pass", false)
 
 	err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false, 10*time.Millisecond, 5*time.Second)
 	if err == nil {
@@ -307,7 +307,7 @@ func TestClientLogin_Non200ReturnsError(t *testing.T) {
 // call reuses the cached token (expires_in=28800) without re-calling /users/auth.
 func TestClientEnsureToken_CachedTokenIsReused(t *testing.T) {
 	mock := newMockMANO(t)
-	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass")
+	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass", false)
 
 	if err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false,
 		10*time.Millisecond, 5*time.Second); err != nil {
@@ -329,7 +329,7 @@ func TestClientEnsureToken_CachedTokenIsReused(t *testing.T) {
 func TestClientEnsureToken_RefreshesWhenAboutToExpire(t *testing.T) {
 	mock := newMockMANO(t)
 	mock.authExpiresIn = "50" // expiry = now+50s; inside the 60s pre-refresh window
-	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass")
+	client := mano.NewClientWithCredentials(mock.srv.URL, "user", "pass", false)
 
 	if err := client.SetIsSource(context.Background(), "cnf-dc", "vdu-pxc", false,
 		10*time.Millisecond, 5*time.Second); err != nil {
