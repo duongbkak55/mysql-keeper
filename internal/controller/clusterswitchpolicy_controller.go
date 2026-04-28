@@ -774,7 +774,8 @@ func (r *ClusterSwitchPolicyReconciler) buildComponents(
 	// read-only introspection regardless of whether state changes flow
 	// through MANO or direct k8s API.
 	localSQL := pxc.NewManager(localDSN, timeout, r.Client,
-		policy.Spec.PXCNamespace, policy.Spec.PXCName, policy.Spec.ReplicationChannelName)
+		policy.Spec.PXCNamespace, policy.Spec.PXCName, policy.Spec.ReplicationChannelName,
+		int(policy.Spec.Switchover.CRDApplyRetries))
 	remoteSQL := pxc.NewRemoteManager(remoteDSN, timeout)
 	comps.localSchemaInit = localSQL
 	comps.remoteSchemaInit = remoteSQL
@@ -823,6 +824,7 @@ func (r *ClusterSwitchPolicyReconciler) buildComponents(
 				policy.Spec.RemoteKubeAPI.PXCNamespace,
 				policy.Spec.RemoteKubeAPI.PXCName,
 				policy.Spec.ReplicationChannelName,
+				int(policy.Spec.Switchover.CRDApplyRetries),
 			)
 		} else {
 			comps.remotePXC = remoteSQL

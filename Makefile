@@ -4,7 +4,7 @@
 # Image settings — override via environment variables.
 IMG            ?= ghcr.io/duongnguyen/mysql-keeper:latest
 DOCKERHUB_IMG  ?= duongbkak55/mysql-keeper
-VERSION        ?= 0.4.4
+VERSION        ?= 0.4.5
 CONTROLLER_GEN_VERSION ?= v0.14.0
 KUSTOMIZE_VERSION ?= v5.3.0
 

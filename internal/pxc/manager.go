@@ -32,19 +32,26 @@ type Manager struct {
 	pxcNamespace string
 	pxcName      string
 	channelName  string
+
+	// crdApplyRetries is how many times to attempt patching isSource on the
+	// PXC CRD before falling back to direct SQL. 0 = SQL-only (legacy default).
+	crdApplyRetries int
 }
 
 // NewManager creates a Manager for the LOCAL cluster.
 // It patches spec.replication.channels[channelName].isSource via the local k8s API
 // so the state persists across operator-triggered pod restarts.
-func NewManager(dsn string, timeout time.Duration, k8sClient client.Client, namespace, name, channelName string) *Manager {
+// crdApplyRetries controls how many CRD patch attempts are made before falling
+// back to direct SQL (0 = SQL-only, the safe default).
+func NewManager(dsn string, timeout time.Duration, k8sClient client.Client, namespace, name, channelName string, crdApplyRetries int) *Manager {
 	return &Manager{
-		dsn:          dsn,
-		timeout:      timeout,
-		k8sClient:    k8sClient,
-		pxcNamespace: namespace,
-		pxcName:      name,
-		channelName:  channelName,
+		dsn:             dsn,
+		timeout:         timeout,
+		k8sClient:       k8sClient,
+		pxcNamespace:    namespace,
+		pxcName:         name,
+		channelName:     channelName,
+		crdApplyRetries: crdApplyRetries,
 	}
 }
 
@@ -56,29 +63,54 @@ func NewRemoteManager(dsn string, timeout time.Duration) *Manager {
 
 // NewRemoteManagerWithKubeAPI creates a Manager for the REMOTE cluster
 // with a k8s client pointing to the remote cluster's API server.
-func NewRemoteManagerWithKubeAPI(dsn string, timeout time.Duration, k8sClient client.Client, namespace, name, channelName string) *Manager {
+// crdApplyRetries mirrors the same semantics as NewManager.
+func NewRemoteManagerWithKubeAPI(dsn string, timeout time.Duration, k8sClient client.Client, namespace, name, channelName string, crdApplyRetries int) *Manager {
 	return &Manager{
-		dsn:          dsn,
-		timeout:      timeout,
-		k8sClient:    k8sClient,
-		pxcNamespace: namespace,
-		pxcName:      name,
-		channelName:  channelName,
+		dsn:             dsn,
+		timeout:         timeout,
+		k8sClient:       k8sClient,
+		pxcNamespace:    namespace,
+		pxcName:         name,
+		channelName:     channelName,
+		crdApplyRetries: crdApplyRetries,
 	}
 }
 
-// SetReadOnly fences the cluster: SET GLOBAL super_read_only=ON + read_only=ON.
-// Then patches isSource=false on the local CRD (if k8s client is available).
+// SetReadOnly fences the cluster to read_only=ON.
+// When crdApplyRetries > 0 and a k8s client is available, it patches
+// isSource=false on the PXC CRD first (up to crdApplyRetries times) and
+// trusts the PXC operator to enforce the MySQL state. Falls back to direct
+// SQL if all CRD attempts fail.
+// When crdApplyRetries == 0 (default), it uses SQL directly then patches
+// the CRD as a best-effort durability step.
 func (m *Manager) SetReadOnly(ctx context.Context) error {
 	logger := log.FromContext(ctx)
-	logger.Info("Setting cluster to read_only=ON via SQL")
 
+	if m.k8sClient != nil && m.crdApplyRetries > 0 {
+		var lastErr error
+		for attempt := 1; attempt <= m.crdApplyRetries; attempt++ {
+			if err := m.patchIsSource(ctx, false); err == nil {
+				logger.Info("Demoted via CRD isSource=false", "attempt", attempt)
+				return nil
+			} else {
+				lastErr = err
+				logger.Error(err, "CRD isSource=false attempt failed",
+					"attempt", attempt, "maxRetries", m.crdApplyRetries)
+			}
+		}
+		logger.Error(lastErr, "CRD-first demote exhausted retries — falling back to direct SQL",
+			"retries", m.crdApplyRetries)
+	}
+
+	logger.Info("Setting cluster to read_only=ON via SQL")
 	if err := m.execReadOnly(ctx, true); err != nil {
 		return err
 	}
 	logger.Info("MySQL read_only=ON applied")
 
-	if m.k8sClient != nil {
+	// Best-effort CRD sync after SQL (only in SQL-first mode; CRD-first mode
+	// already attempted above and would re-patch here unnecessarily).
+	if m.k8sClient != nil && m.crdApplyRetries == 0 {
 		if err := m.patchIsSource(ctx, false); err != nil {
 			logger.Error(err, "Failed to patch CRD isSource=false (non-fatal: SQL change is active)")
 		} else {
@@ -88,11 +120,43 @@ func (m *Manager) SetReadOnly(ctx context.Context) error {
 	return nil
 }
 
-// SetReadWrite promotes the cluster: verifies wsrep Primary, sets read_only=OFF,
-// verifies write, stops any old inbound replication so the new source is not
-// fighting its own former upstream, then patches isSource=true on the local CRD.
+// SetReadWrite promotes the cluster: when crdApplyRetries > 0 it patches
+// isSource=true on the PXC CRD first (up to crdApplyRetries times) and trusts
+// the operator to set read_only=OFF, only falling back to direct SQL if all CRD
+// attempts fail. In SQL-first mode (crdApplyRetries == 0) it verifies wsrep
+// Primary, sets read_only=OFF, verifies a write, stops inbound replication, then
+// patches the CRD as a best-effort durability step.
 func (m *Manager) SetReadWrite(ctx context.Context) error {
 	logger := log.FromContext(ctx)
+
+	if m.k8sClient != nil && m.crdApplyRetries > 0 {
+		var lastErr error
+		for attempt := 1; attempt <= m.crdApplyRetries; attempt++ {
+			if err := m.patchIsSource(ctx, true); err == nil {
+				logger.Info("Promoted via CRD isSource=true", "attempt", attempt)
+				// Stop inbound replication even in CRD-first path: this node is
+				// now source, it must not keep replicating from the old upstream.
+				if m.channelName != "" {
+					if err := m.StopReplica(ctx, m.channelName); err != nil {
+						logger.Error(err, "STOP REPLICA after CRD promote failed — investigate",
+							"channel", m.channelName)
+					}
+					if err := m.ResetReplicaAll(ctx, m.channelName); err != nil {
+						logger.Error(err, "RESET REPLICA ALL after CRD promote failed — investigate",
+							"channel", m.channelName)
+					}
+				}
+				return nil
+			} else {
+				lastErr = err
+				logger.Error(err, "CRD isSource=true attempt failed",
+					"attempt", attempt, "maxRetries", m.crdApplyRetries)
+			}
+		}
+		logger.Error(lastErr, "CRD-first promote exhausted retries — falling back to direct SQL",
+			"retries", m.crdApplyRetries)
+	}
+
 	logger.Info("Promoting cluster to read_only=OFF via SQL")
 
 	db, err := m.openDB(ctx)
@@ -148,7 +212,9 @@ func (m *Manager) SetReadWrite(ctx context.Context) error {
 		}
 	}
 
-	if m.k8sClient != nil {
+	// Best-effort CRD sync after SQL (only in SQL-first mode; CRD-first mode
+	// already attempted above and would re-patch here unnecessarily).
+	if m.k8sClient != nil && m.crdApplyRetries == 0 {
 		if err := m.patchIsSource(ctx, true); err != nil {
 			logger.Error(err, "Failed to patch CRD isSource=true (non-fatal: SQL change is active)")
 		} else {

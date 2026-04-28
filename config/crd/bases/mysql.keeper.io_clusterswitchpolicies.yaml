@@ -505,6 +505,15 @@ spec:
                       Protects against ping-pong when a transient incident causes both sides to
                       flap. Default 10 minutes.
                     type: string
+                  crdApplyRetries:
+                    default: 0
+                    description: |-
+                      CRDApplyRetries is how many times the controller will attempt to promote
+                      or demote a cluster by patching spec.replication.channels[].isSource on
+                      the PerconaXtraDBCluster CRD before falling back to direct SQL queries.
+                      0 (default) disables the CRD-first path and uses direct SQL only.
+                    format: int32
+                    type: integer
                   drainTimeout:
                     default: 30s
                     description: |-

@@ -335,6 +335,16 @@ type SwitchoverConfig struct {
 	// +kubebuilder:default="10s"
 	FenceTimeout metav1.Duration `json:"fenceTimeout"`
 
+	// CRDApplyRetries is how many times the controller will attempt to promote
+	// or demote a cluster by patching spec.replication.channels[].isSource on
+	// the PerconaXtraDBCluster CRD before falling back to direct SQL queries.
+	// 0 (default) disables the CRD-first path and uses direct SQL only.
+	// Only effective in the non-MANO case when a k8s client is available for
+	// the target cluster (local always; remote requires spec.remoteKubeAPI).
+	// +kubebuilder:default=0
+	// +optional
+	CRDApplyRetries int32 `json:"crdApplyRetries,omitempty"`
+
 	// CooldownPeriod is the minimum interval between two successive switchovers.
 	// Protects against ping-pong when a transient incident causes both sides to
 	// flap. Default 10 minutes.
