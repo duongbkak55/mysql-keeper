@@ -769,6 +769,41 @@ spec:
                       string (e.g. "Primary").
                     type: string
                 type: object
+              gtidLag:
+                description: GTIDLag is the most recent replication-lag measurement,
+                  refreshed every health-check interval.
+                properties:
+                  lagSeconds:
+                    description: |-
+                      LagSeconds is the estimated lag derived from ORIGINAL_COMMIT_TIMESTAMP
+                      of the last applied transaction on the replica. -1 means unavailable.
+                    format: int64
+                    type: integer
+                  localGTIDExecuted:
+                    description: |-
+                      LocalGTIDExecuted is the raw @@GLOBAL.gtid_executed from the local
+                      (source) cluster at measurement time. Refreshed every health-check
+                      interval so operators can compare directly against a live MySQL query.
+                    type: string
+                  measuredAt:
+                    description: MeasuredAt is when this measurement was collected.
+                    format: date-time
+                    type: string
+                  missingTransactions:
+                    description: MissingTransactions is the GTID_SUBTRACT count of
+                      transactions the replica has not yet applied.
+                    format: int64
+                    type: integer
+                  remoteGTIDMissing:
+                    description: |-
+                      RemoteGTIDMissing is the GTID set the remote replica is still missing
+                      (GTID_SUBTRACT(local, remote)). Empty string means fully caught up.
+                    type: string
+                required:
+                - lagSeconds
+                - measuredAt
+                - missingTransactions
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the last spec generation the controller
                   processed.

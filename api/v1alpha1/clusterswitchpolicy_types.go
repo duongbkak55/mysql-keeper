@@ -533,6 +533,19 @@ type GTIDLagStatus struct {
 
 	// MeasuredAt is when this measurement was collected.
 	MeasuredAt metav1.Time `json:"measuredAt"`
+
+	// LocalGTIDExecuted is the raw @@GLOBAL.gtid_executed string from the
+	// local (source) cluster at the time of this measurement. Refreshed every
+	// health-check interval so operators can compare it directly against a live
+	// MySQL query without waiting for a switchover.
+	// +optional
+	LocalGTIDExecuted string `json:"localGTIDExecuted,omitempty"`
+
+	// RemoteGTIDExecuted is the GTID set the remote (replica) cluster is still
+	// missing from the source, expressed as GTID_SUBTRACT(local, remote).
+	// An empty string means the replica is fully caught up.
+	// +optional
+	RemoteGTIDMissing string `json:"remoteGTIDMissing,omitempty"`
 }
 
 // ClusterHealthStatus holds the observed health of one cluster.

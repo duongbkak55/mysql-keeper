@@ -89,31 +89,32 @@ func (r *ClusterSwitchPolicyReconciler) observeGTIDLag(
 	ctx context.Context,
 	policy *mysqlv1alpha1.ClusterSwitchPolicy,
 	comps *componentSet,
-) (missing, lagSec int64, measured bool) {
+) (missing, lagSec int64, localGTID, missingSet string, measured bool) {
 	localChannel := policy.Spec.ReplicationChannelName
 	remoteChannel := policy.Spec.PeerReplicationChannelName
 	if remoteChannel == "" {
 		remoteChannel = localChannel
 	}
 	if localChannel == "" || comps.localInspector == nil || comps.remoteInspector == nil {
-		return 0, -1, false
+		return 0, -1, "", "", false
 	}
 
 	logger := ctrl.LoggerFrom(ctx)
 	role := policy.Spec.ClusterRole
 
 	// Step 1: snapshot the source (local) GTID set.
-	localGTID, err := comps.localInspector.GetExecutedGTID(ctx)
+	var err error
+	localGTID, err = comps.localInspector.GetExecutedGTID(ctx)
 	if err != nil {
 		logger.V(1).Info("gtid lag: GetExecutedGTID on local failed", "err", err)
-		return 0, -1, false
+		return 0, -1, "", "", false
 	}
 
 	// Step 2: compute what the replica is missing.
-	missingSet, err := comps.remoteInspector.MissingGTIDs(ctx, localGTID)
+	missingSet, err = comps.remoteInspector.MissingGTIDs(ctx, localGTID)
 	if err != nil {
 		logger.V(1).Info("gtid lag: MissingGTIDs on remote failed", "err", err)
-		return 0, -1, false
+		return 0, -1, localGTID, "", false
 	}
 	missing = pxc.CountGTIDTransactions(missingSet)
 	metrics.GTIDMissingTransactions.WithLabelValues(role).Set(float64(missing))
@@ -132,14 +133,16 @@ func (r *ClusterSwitchPolicyReconciler) observeGTIDLag(
 		metrics.ReplicationLagSeconds.WithLabelValues(role, remoteChannel).Set(float64(lagSec))
 	}
 
-	return missing, lagSec, true
+	return missing, lagSec, localGTID, missingSet, true
 }
 
 // gtidLagStatusFor builds the GTIDLagStatus value to persist on the CR.
-func gtidLagStatusFor(missing, lagSec int64) *mysqlv1alpha1.GTIDLagStatus {
+func gtidLagStatusFor(missing, lagSec int64, localGTID, missingSet string) *mysqlv1alpha1.GTIDLagStatus {
 	return &mysqlv1alpha1.GTIDLagStatus{
 		MissingTransactions: missing,
 		LagSeconds:          lagSec,
 		MeasuredAt:          metav1.Now(),
+		LocalGTIDExecuted:   localGTID,
+		RemoteGTIDMissing:   missingSet,
 	}
 }
