@@ -15,7 +15,9 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -231,8 +233,11 @@ func (c *Client) pollLcmOpOcc(ctx context.Context, id, token string, pollInterva
 		var occ lcmOpOcc
 		decodeErr := json.NewDecoder(resp.Body).Decode(&occ)
 		resp.Body.Close()
-		if decodeErr != nil {
-			return fmt.Errorf("decode lcm-op-occ response: %w", decodeErr)
+
+		// An empty body (io.EOF) means the op is not yet recorded — treat as
+		// still in progress and retry rather than failing hard.
+		if decodeErr != nil && !errors.Is(decodeErr, io.EOF) {
+			return fmt.Errorf("decode lcm-op-occ response (HTTP %d): %w", resp.StatusCode, decodeErr)
 		}
 
 		switch occ.OperationState {
@@ -245,7 +250,7 @@ func (c *Client) pollLcmOpOcc(ctx context.Context, id, token string, pollInterva
 			}
 			return fmt.Errorf("MANO LCM op %s failed: %s", id, detail)
 		}
-		// STARTING / PROCESSING — wait and retry.
+		// STARTING / PROCESSING / empty body — wait and retry.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
