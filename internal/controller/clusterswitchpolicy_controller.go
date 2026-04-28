@@ -650,6 +650,16 @@ func (r *ClusterSwitchPolicyReconciler) updateHealthStatus(
 			}
 		}
 	}
+
+	// Self-correct activeCluster when the local cluster is writable but the
+	// status still points at the remote. This happens when the peer controller
+	// executed a successful switchover that this controller was not involved in
+	// (e.g. DC controller failed over to DR; DR controller's CR never updated).
+	if localH.Writable == health.WritableYes &&
+		policy.Status.ActiveCluster != "" &&
+		policy.Status.ActiveCluster != policy.Spec.ClusterRole {
+		policy.Status.ActiveCluster = policy.Spec.ClusterRole
+	}
 }
 
 // updateSplitBrainCondition folds the tri-state writable flags into the
