@@ -105,6 +105,16 @@ spec:
                       that must be reachable to consider ProxySQL healthy.
                     format: int32
                     type: integer
+                  remoteUnreachableThreshold:
+                    default: 0
+                    description: |-
+                      RemoteUnreachableThreshold, when positive, enables an additional
+                      auto-failover gate: if the remote MySQL has been TCP-unreachable for
+                      this many consecutive health checks AND AllowDataLossFailover=true,
+                      the controller will promote the remote cluster even though it cannot
+                      run the GTID subset preflight. Zero (default) disables this path.
+                    format: int32
+                    type: integer
                 required:
                 - failureThreshold
                 - interval
@@ -660,6 +670,13 @@ spec:
               consecutiveRemoteFailures:
                 description: ConsecutiveRemoteFailures tracks consecutive health check
                   failures for the remote cluster.
+                format: int32
+                type: integer
+              consecutiveRemoteUnreachable:
+                description: |-
+                  ConsecutiveRemoteUnreachable counts how many successive health check cycles
+                  found the remote MySQL TCP-unreachable (WritableUnknown). Resets to zero
+                  as soon as the remote responds. Drives the remoteUnreachableThreshold gate.
                 format: int32
                 type: integer
               lastPreFlight:
