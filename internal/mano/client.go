@@ -169,7 +169,7 @@ func (c *Client) SetIsSource(ctx context.Context, cnfName, vduName string, isSou
 		VDUName: vduName,
 		UpdateVduOperatorRequest: updateVduOperatorRequest{
 			Description:  fmt.Sprintf("mysql-keeper: set isSource=%s", isSourceStr),
-			TimeoutTimer: pollTimeout.String(),
+			TimeoutTimer: fmt.Sprintf("%ds", int(pollTimeout.Seconds())),
 			UpdateFields: map[string]string{
 				"replicationChannels[0].isSource": isSourceStr,
 			},
@@ -181,7 +181,7 @@ func (c *Client) SetIsSource(ctx context.Context, cnfName, vduName string, isSou
 		return fmt.Errorf("marshal MANO request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/cnflcm/v1/custom-resources/%s/%s/update", c.baseURL, cnfName, vduName)
+	url := fmt.Sprintf("%s/cnflcm/v1/custom-resources/cnf/vdu/update", c.baseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("build MANO update request: %w", err)
