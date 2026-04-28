@@ -193,6 +193,18 @@ func (p PreFlight) checkRemoteReplicationRunning(ctx context.Context) CheckResul
 		return withElapsed(c, start)
 	}
 	if !status.Running() {
+		// When the source cluster is completely unreachable the replica IO
+		// thread stops — that is the expected MySQL behaviour, not a problem
+		// we need to block on. AllowDataLossFailover=true is the operator's
+		// explicit signal that the source is gone; in that case a stopped
+		// channel is the reason we are failing over, so we downgrade C3 to
+		// Soft and let the promote phase issue STOP/RESET REPLICA itself.
+		if p.AllowDataLossFailover {
+			c.Severity = SeveritySoft
+			c.Passed = true
+			c.Message = fmt.Sprintf("replication not running but AllowDataLossFailover=true — source likely down (%s)", status.HumanMessage())
+			return withElapsed(c, start)
+		}
 		c.Message = status.HumanMessage()
 		return withElapsed(c, start)
 	}
