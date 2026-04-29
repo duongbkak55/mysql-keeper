@@ -26,6 +26,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -69,6 +70,16 @@ type ClusterSwitchPolicyReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	// schemaEnsured caches which "<policyUID>/<side>" keys have had their
+	// keeper schema (keeper.probe + keeper.leader) confirmed on MySQL.
+	// Keyed by policy UID + "/local" or "/remote". Avoids sending DDL on
+	// every reconcile cycle — the Manager is rebuilt per-reconcile so the
+	// guard cannot live there. Populated on first success; cleared on error
+	// so the next reconcile retries. Reset to empty on controller restart,
+	// which is acceptable: the tables already exist so the single DDL on
+	// restart is a cheap IF NOT EXISTS no-op.
+	schemaEnsured sync.Map
 }
 
 // componentSet groups everything we build per-reconcile so the signature of
@@ -522,10 +533,15 @@ func (r *ClusterSwitchPolicyReconciler) writeSwitchoverResult(
 	return ctrl.Result{RequeueAfter: policy.Spec.HealthCheck.Interval.Duration}, nil
 }
 
-// ensureKeeperSchema runs EnsureKeeperSchema on whichever cluster is currently
-// writable. This is the bug-4.4 fix: SetReadWrite's write probe needs the table
-// to exist, and previously nothing ever created it. We only write to a cluster
-// whose Writable == WritableYes so we never try SQL DDL on a read-only replica.
+// ensureKeeperSchema runs EnsureKeeperSchema + EnsureLeaderLeaseSchema on
+// whichever cluster is currently writable, but only once per controller
+// lifetime per side. The Manager is rebuilt on every reconcile so the guard
+// lives here on the singleton reconciler via schemaEnsured (sync.Map).
+//
+// Cache key: "<policyUID>/local" or "<policyUID>/remote".
+// On DDL error the key is NOT stored so the next reconcile retries.
+// On controller restart the cache is empty; the single DDL that fires is a
+// cheap IF NOT EXISTS no-op because the tables already exist.
 func (r *ClusterSwitchPolicyReconciler) ensureKeeperSchema(
 	ctx context.Context,
 	policy *mysqlv1alpha1.ClusterSwitchPolicy,
@@ -533,24 +549,47 @@ func (r *ClusterSwitchPolicyReconciler) ensureKeeperSchema(
 	localHealth, remoteHealth health.ClusterHealth,
 ) {
 	logger := log.FromContext(ctx)
+	uid := string(policy.UID)
 
 	if localHealth.Writable == health.WritableYes && comps.localSchemaInit != nil {
-		if err := comps.localSchemaInit.EnsureKeeperSchema(ctx); err != nil {
-			logger.Error(err, "EnsureKeeperSchema on local writable cluster failed")
-		}
-		if err := comps.localSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
-			logger.Error(err, "EnsureLeaderLeaseSchema on local writable cluster failed")
+		key := uid + "/local"
+		if _, done := r.schemaEnsured.Load(key); !done {
+			ok := true
+			if err := comps.localSchemaInit.EnsureKeeperSchema(ctx); err != nil {
+				logger.Error(err, "EnsureKeeperSchema on local writable cluster failed")
+				ok = false
+			}
+			if ok {
+				if err := comps.localSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
+					logger.Error(err, "EnsureLeaderLeaseSchema on local writable cluster failed")
+					ok = false
+				}
+			}
+			if ok {
+				r.schemaEnsured.Store(key, struct{}{})
+			}
 		}
 	}
+
 	if remoteHealth.Writable == health.WritableYes && comps.remoteSchemaInit != nil {
-		if err := comps.remoteSchemaInit.EnsureKeeperSchema(ctx); err != nil {
-			logger.Error(err, "EnsureKeeperSchema on remote writable cluster failed")
-		}
-		if err := comps.remoteSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
-			logger.Error(err, "EnsureLeaderLeaseSchema on remote writable cluster failed")
+		key := uid + "/remote"
+		if _, done := r.schemaEnsured.Load(key); !done {
+			ok := true
+			if err := comps.remoteSchemaInit.EnsureKeeperSchema(ctx); err != nil {
+				logger.Error(err, "EnsureKeeperSchema on remote writable cluster failed")
+				ok = false
+			}
+			if ok {
+				if err := comps.remoteSchemaInit.EnsureLeaderLeaseSchema(ctx); err != nil {
+					logger.Error(err, "EnsureLeaderLeaseSchema on remote writable cluster failed")
+					ok = false
+				}
+			}
+			if ok {
+				r.schemaEnsured.Store(key, struct{}{})
+			}
 		}
 	}
-	_ = policy // reserved for future use (config-driven enable/disable)
 }
 
 // heartbeatLeaderLease renews keeper.leader on the active (writable) cluster
