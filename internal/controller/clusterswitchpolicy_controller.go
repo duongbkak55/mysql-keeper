@@ -167,6 +167,10 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	comps, err := r.buildComponents(ctx, policy)
 	if err != nil {
 		logger.Error(err, "buildComponents failed")
+		// Register label combinations even on failure so the gauge time-series
+		// are always present in /metrics (Prometheus GaugeVec only appears
+		// after the first WithLabelValues().Set() call).
+		r.updateMetrics(policy, health.ClusterHealth{}, health.ClusterHealth{})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
