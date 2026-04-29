@@ -4,6 +4,82 @@ All notable changes to `mysql-keeper` are documented in this file. Dates are
 ISO-8601. Releases follow semantic versioning for the external CRD API; the
 internal Go packages may change without notice between releases.
 
+## [0.4.9] — 2026-04-29 — Degraded recovery via annotation and auto-interval
+
+### Added
+
+- **Annotation-triggered recovery** — patch `mysql.keeper.io/recover-degraded`
+  with any new non-empty value while `Phase==Degraded` to fire an immediate
+  health re-evaluation without restarting the controller or editing status:
+  ```sh
+  kubectl annotate clusterswitchpolicy <name> \
+    mysql.keeper.io/recover-degraded=$(date +%s) --overwrite
+  ```
+  The controller compares the current annotation value against
+  `status.lastRecoveryAnnotation`; a changed value fires one recovery attempt.
+
+- **`spec.recovery.autoRecoveryInterval`** — when set to a non-zero duration
+  (e.g. `5m`), the controller periodically re-evaluates cluster health while
+  in Degraded phase. If both clusters are healthy and exactly one is writable,
+  the policy automatically transitions back to Monitoring.
+
+- **`status.lastDegradedRecoveryAttempt`** — timestamp of the most recent
+  recovery evaluation (annotation or auto), visible via `kubectl describe`.
+
+- **`status.lastRecoveryAnnotation`** — the last annotation value that was
+  processed, used to detect new annotation patches.
+
+### Recovery conditions
+
+Both must pass before the phase transitions to Monitoring:
+1. Both local and remote clusters report `healthy=true`.
+2. Exactly one cluster is writable (no split-brain, not both read-only).
+
+On success: `Phase=Monitoring`, `SwitchoverProgress` cleared, `Normal/DegradedRecovery` event emitted.
+On failure: `Warning/DegradedRecoveryFailed` event, policy stays Degraded.
+
+### Fixed
+
+- `handleStuckSwitchover` no longer re-triggers on progress entries that
+  already have `FailedPhase` set. Previously, once the `ResumeStuckTimeout`
+  elapsed after a failed switchover the stuck-timeout path would re-fire every
+  reconcile, preventing `handleDegradedRecovery` from ever running.
+
+### Upgrade notes
+
+- Re-apply the CRD (`config/crd/`) to pick up the new `spec.recovery` and
+  status fields.
+- Existing CRs in Degraded state will stay Degraded until you either patch
+  the annotation or configure `spec.recovery.autoRecoveryInterval`.
+
+---
+
+## [0.4.8] — 2026-04-28 — ActiveCluster self-correction
+
+- Self-correct `activeCluster` when the local cluster becomes writable without
+  a switchover (peer-initiated flip not observed by this controller).
+
+## [0.4.7] — 2026-04-28 — MANO EOF poll fix
+
+- Treat an empty/EOF `lcm-op-occ` response body as in-progress instead of a
+  fatal error, preventing premature abort of MANO LCM operations.
+
+## [0.4.6] — 2026-04-28 — MANO URL and TimeoutTimer format fix
+
+- Corrected MANO CNF LCM update URL path and `timeoutTimer` field formatting.
+
+## [0.4.5] — 2026-04-28 — CRD-first promote/demote with SQL fallback
+
+- `SetReadOnly` / `SetReadWrite` now attempt to patch `spec.replication.channels[].isSource`
+  on the PerconaXtraDBCluster CRD first, falling back to direct SQL.
+- New `spec.switchover.crdApplyRetries` controls how many CRD patch attempts
+  are made before the SQL fallback fires (0 = SQL only, the previous behaviour).
+
+## [0.4.2] — 2026-04-28 — Live GTID string fields in CR status
+
+- Added `status.gtidLag.localGTIDExecuted` and `remoteGTIDMissing` string
+  fields for direct GTID comparison without running MySQL queries.
+
 ## [0.4.0] — 2026-04-25 — Remote-unreachable auto-failover
 
 ### Added
