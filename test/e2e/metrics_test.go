@@ -11,18 +11,25 @@ import (
 	"time"
 )
 
-// TestE2E_MetricsExposed covers 5.1. After the controller pod is up we hit
-// its /metrics endpoint and look for the keeper namespace in the exposition
-// text. We do not verify every metric — the unit tests already cover which
-// metrics exist; this is the smoke test that the scrape path is actually
-// wired on a real cluster.
-//
-// The NodePort route (127.0.0.1:30080 → Service → Pod:8080) can be slow to
-// settle after a fresh kind cluster. Retry for up to 60s on empty bodies
-// and transient connection errors before giving up.
+// TestE2E_MetricsExposed covers 5.1. We create a CSP so the controller
+// reconciles it and calls updateMetrics (which registers the GaugeVec labels).
+// Only after at least one reconcile cycle will mysql_keeper_cluster_healthy
+// appear in the /metrics exposition — polling without a CSP would always see
+// an empty keeper namespace.
 func TestE2E_MetricsExposed(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+
+	c := newClient(t)
+	name := "e2e-metrics-" + shortUUID(t)
+
+	csp := fixtureCSP(name)
+	mustCreate(t, ctx, c, csp)
+	t.Cleanup(func() { removeFinalizerAndDelete(t, c, name) })
+
+	// Wait for the controller to reconcile the CSP at least once. The
+	// finalizer being attached is the cheapest proof of a completed reconcile.
+	waitForFinalizer(t, ctx, c, name, 45*time.Second)
 
 	url := metricsURL(t)
 	deadline := time.Now().Add(60 * time.Second)
@@ -47,8 +54,8 @@ func TestE2E_MetricsExposed(t *testing.T) {
 		// which requires an actual switchover attempt and is out of scope
 		// for this smoke test. The reconciler calls Set() on
 		// mysql_keeper_cluster_healthy every reconcile cycle, so we look
-		// for that plus the generic "mysql_keeper_" prefix HELP line to
-		// prove the whole keeper namespace is wired.
+		// for that plus mysql_keeper_cluster_writable to prove both gauges
+		// are wired.
 		if resp.StatusCode == http.StatusOK &&
 			strings.Contains(lastBody, "mysql_keeper_cluster_healthy") &&
 			strings.Contains(lastBody, "mysql_keeper_cluster_writable") {
