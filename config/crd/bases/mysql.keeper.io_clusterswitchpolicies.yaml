@@ -576,6 +576,20 @@ spec:
                 - remoteWriterPort
                 - timeout
                 type: object
+              recovery:
+                description: Recovery configures how the controller attempts to exit
+                  the Degraded phase.
+                properties:
+                  autoRecoveryInterval:
+                    description: |-
+                      AutoRecoveryInterval, when positive, causes the controller to
+                      periodically re-evaluate cluster health while in Degraded phase.
+                      If both clusters are healthy and exactly one is writable, the
+                      controller transitions back to Monitoring automatically.
+                      0 (default) disables periodic auto-recovery; use the
+                      mysql.keeper.io/recover-degraded annotation for manual one-shot recovery.
+                    type: string
+                type: object
             required:
             - autoFailover
             - clusterRole
@@ -736,6 +750,18 @@ spec:
                 required:
                 - passedAt
                 type: object
+              lastDegradedRecoveryAttempt:
+                description: LastDegradedRecoveryAttempt is when the controller last
+                  evaluated whether it could exit the Degraded phase (annotation-triggered
+                  or automatic).
+                format: date-time
+                type: string
+              lastRecoveryAnnotation:
+                description: LastRecoveryAnnotation tracks the annotation value from
+                  mysql.keeper.io/recover-degraded that was last processed. A change
+                  in the annotation value while Phase == Degraded fires an immediate
+                  recovery evaluation.
+                type: string
               lastSwitchoverReason:
                 description: LastSwitchoverReason is a human-readable description
                   of the last switchover trigger.

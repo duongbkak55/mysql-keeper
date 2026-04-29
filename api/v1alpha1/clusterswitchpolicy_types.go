@@ -130,6 +130,10 @@ type ClusterSwitchPolicySpec struct {
 	// +kubebuilder:validation:Enum="";promote-remote
 	// +optional
 	ManualSwitchoverTarget string `json:"manualSwitchoverTarget,omitempty"`
+
+	// Recovery configures how the controller attempts to exit the Degraded phase.
+	// +optional
+	Recovery RecoveryConfig `json:"recovery,omitempty"`
 }
 
 // MANOConfig configures the MANO LCM API for toggling isSource on PXC CNFs.
@@ -434,6 +438,18 @@ type ClusterSwitchPolicyStatus struct {
 	// +optional
 	LastSwitchoverReason string `json:"lastSwitchoverReason,omitempty"`
 
+	// LastDegradedRecoveryAttempt is when the controller last evaluated whether
+	// it could exit the Degraded phase (annotation-triggered or automatic).
+	// +optional
+	LastDegradedRecoveryAttempt *metav1.Time `json:"lastDegradedRecoveryAttempt,omitempty"`
+
+	// LastRecoveryAnnotation tracks the annotation value from
+	// mysql.keeper.io/recover-degraded that was last processed. A change in
+	// the annotation value while Phase == Degraded fires an immediate
+	// recovery evaluation.
+	// +optional
+	LastRecoveryAnnotation string `json:"lastRecoveryAnnotation,omitempty"`
+
 	// SwitchoverProgress is set while Phase == SwitchingOver and describes how
 	// far the engine has progressed. Used for checkpoint/resume after pod
 	// restart and for operator-facing diagnostics.
@@ -611,6 +627,18 @@ type ClusterHealthStatus struct {
 	// Message contains additional diagnostic information.
 	// +optional
 	Message string `json:"message,omitempty"`
+}
+
+// RecoveryConfig controls how the controller attempts to exit the Degraded phase.
+type RecoveryConfig struct {
+	// AutoRecoveryInterval, when positive, causes the controller to
+	// periodically re-evaluate cluster health while in Degraded phase.
+	// If both clusters are healthy and exactly one is writable, the
+	// controller transitions back to Monitoring automatically.
+	// 0 (default) disables periodic auto-recovery; use the
+	// mysql.keeper.io/recover-degraded annotation for manual one-shot recovery.
+	// +optional
+	AutoRecoveryInterval metav1.Duration `json:"autoRecoveryInterval,omitempty"`
 }
 
 // Phase constants.

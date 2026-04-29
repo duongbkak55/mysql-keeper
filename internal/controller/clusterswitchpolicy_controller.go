@@ -49,6 +49,14 @@ import (
 	"github.com/duongnguyen/mysql-keeper/internal/switchover"
 )
 
+// AnnotationRecoverDegraded is patched by operators to trigger an immediate
+// health re-evaluation while the policy is in Degraded phase. The controller
+// compares the current annotation value against status.lastRecoveryAnnotation;
+// any new, non-empty value fires one recovery attempt regardless of
+// spec.recovery.autoRecoveryInterval. Use a timestamp or UUID as the value so
+// each patch is distinct.
+const AnnotationRecoverDegraded = "mysql.keeper.io/recover-degraded"
+
 // ClusterSwitchPolicyReconciler reconciles a ClusterSwitchPolicy object.
 // +kubebuilder:rbac:groups=mysql.keeper.io,resources=clusterswitchpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=mysql.keeper.io,resources=clusterswitchpolicies/status,verbs=get;update;patch
@@ -201,6 +209,14 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 		return *resumeResult, nil
 	}
 
+	// Degraded phase: only exit via deliberate recovery (annotation change or
+	// auto-interval). Bypass the normal "nothing to switch → Monitoring" path so
+	// the policy stays Degraded until the operator explicitly acknowledges it or
+	// the configured auto-recovery interval elapses and health checks pass.
+	if policy.Status.Phase == mysqlv1alpha1.PhaseDegraded {
+		return r.handleDegradedRecovery(ctx, policy, localHealth, remoteHealth)
+	}
+
 	reason, shouldSwitch := r.decideSwitchover(ctx, policy, comps, localHealth, remoteHealth)
 	logger.Info("should_switchover",
 		"event", "should_switchover",
@@ -273,6 +289,11 @@ func (r *ClusterSwitchPolicyReconciler) handleStuckSwitchover(
 ) *ctrl.Result {
 	prog := policy.Status.SwitchoverProgress
 	if prog == nil {
+		return nil
+	}
+	// Already failed — FailedPhase is recorded, this is not a stuck in-progress
+	// operation. Let handleDegradedRecovery own the exit path.
+	if prog.FailedPhase != "" {
 		return nil
 	}
 	logger := log.FromContext(ctx)
@@ -934,6 +955,90 @@ func (r *ClusterSwitchPolicyReconciler) readSecret(ctx context.Context, ref mysq
 		return "", "", fmt.Errorf("Secret %s/%s missing 'password' key", ns, ref.Name)
 	}
 	return string(u), string(p), nil
+}
+
+// handleDegradedRecovery is the sole exit path from Degraded phase. It fires
+// when either:
+//   - the mysql.keeper.io/recover-degraded annotation value has changed (manual
+//     one-shot trigger — patch any new non-empty string value to invoke), or
+//   - spec.recovery.autoRecoveryInterval > 0 and enough time has elapsed since
+//     the last attempt.
+//
+// Recovery succeeds when both clusters are healthy and exactly one is writable.
+// On success the phase transitions to Monitoring and SwitchoverProgress is
+// cleared. On failure the policy stays Degraded and the next attempt time is
+// scheduled via the returned Result.
+func (r *ClusterSwitchPolicyReconciler) handleDegradedRecovery(
+	ctx context.Context,
+	policy *mysqlv1alpha1.ClusterSwitchPolicy,
+	localHealth, remoteHealth health.ClusterHealth,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	annotationVal := policy.Annotations[AnnotationRecoverDegraded]
+	annotationChanged := annotationVal != "" && annotationVal != policy.Status.LastRecoveryAnnotation
+
+	autoInterval := policy.Spec.Recovery.AutoRecoveryInterval.Duration
+	autoReady := autoInterval > 0 && (policy.Status.LastDegradedRecoveryAttempt == nil ||
+		time.Since(policy.Status.LastDegradedRecoveryAttempt.Time) >= autoInterval)
+
+	if !annotationChanged && !autoReady {
+		requeueAfter := policy.Spec.HealthCheck.Interval.Duration
+		if autoInterval > 0 && autoInterval < requeueAfter {
+			requeueAfter = autoInterval
+		}
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	trigger := "auto"
+	if annotationChanged {
+		trigger = "annotation"
+	}
+	logger.Info("Evaluating degraded recovery",
+		"trigger", trigger,
+		"localHealthy", localHealth.Healthy,
+		"remoteHealthy", remoteHealth.Healthy,
+		"localWritable", localHealth.Writable.String(),
+		"remoteWritable", remoteHealth.Writable.String(),
+	)
+
+	now := metav1.Now()
+	patch := client.MergeFrom(policy.DeepCopy())
+	policy.Status.LastDegradedRecoveryAttempt = &now
+	if annotationChanged {
+		policy.Status.LastRecoveryAnnotation = annotationVal
+	}
+
+	bothHealthy := localHealth.Healthy && remoteHealth.Healthy
+	exactlyOneWritable := (localHealth.Writable == health.WritableYes) != (remoteHealth.Writable == health.WritableYes)
+
+	if bothHealthy && exactlyOneWritable {
+		logger.Info("Degraded recovery succeeded — transitioning to Monitoring", "trigger", trigger)
+		policy.Status.Phase = mysqlv1alpha1.PhaseMonitoring
+		policy.Status.SwitchoverProgress = nil
+		if r.Recorder != nil {
+			r.Recorder.Event(policy, corev1.EventTypeNormal, "DegradedRecovery",
+				fmt.Sprintf("cluster health restored (%s trigger) — returned to Monitoring", trigger))
+		}
+	} else {
+		logger.Info("Degraded recovery: cluster not yet healthy, staying Degraded", "trigger", trigger)
+		if r.Recorder != nil {
+			r.Recorder.Event(policy, corev1.EventTypeWarning, "DegradedRecoveryFailed",
+				fmt.Sprintf("recovery check (%s trigger): local_healthy=%v remote_healthy=%v localWritable=%s remoteWritable=%s — staying Degraded",
+					trigger, localHealth.Healthy, remoteHealth.Healthy,
+					localHealth.Writable.String(), remoteHealth.Writable.String()))
+		}
+	}
+
+	if err := r.Status().Patch(ctx, policy, patch); err != nil {
+		return ctrl.Result{}, fmt.Errorf("patch status during degraded recovery: %w", err)
+	}
+
+	requeueAfter := policy.Spec.HealthCheck.Interval.Duration
+	if policy.Status.Phase == mysqlv1alpha1.PhaseDegraded && autoInterval > 0 && autoInterval < requeueAfter {
+		requeueAfter = autoInterval
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
