@@ -108,8 +108,7 @@ func resetLeaseRow(ctx context.Context, t *testing.T) {
 		UPDATE keeper.leader
 		SET owner = '', epoch = 0,
 		    acquired_at = NOW(6),
-		    heartbeat_at = '1970-01-01 00:00:01',
-		    renewed_by = ''
+		    heartbeat_at = '1970-01-01 00:00:01'
 		WHERE id = 1
 	`); err != nil {
 		t.Fatalf("reset keeper.leader: %v", err)

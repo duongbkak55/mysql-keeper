@@ -22,20 +22,14 @@ func TestLease_FirstAcquireOnSeededRow(t *testing.T) {
 
 	epoch0 := time.Unix(1, 0).UTC()
 	mock.ExpectBegin()
-	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("", int64(0), epoch0, epoch0, "")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1 FOR UPDATE").
+	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at"}).
+		AddRow("", int64(0), epoch0, epoch0)
+	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at FROM keeper.leader WHERE id = 1 FOR UPDATE").
 		WillReturnRows(rows)
 	mock.ExpectExec("UPDATE keeper.leader SET owner = ?, epoch = ?, acquired_at = NOW").
-		WithArgs("dc-controller", int64(1), "dc-controller").
+		WithArgs("dc-controller", int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-
-	now := time.Now().UTC()
-	refreshed := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dc-controller", int64(1), now, now, "dc-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1").
-		WillReturnRows(refreshed)
 
 	m := &Manager{dsn: "mock", timeout: 2 * time.Second}
 	lease, err := m.runAcquireOrRenew(context.Background(), db, "dc-controller", 30*time.Second)
@@ -58,19 +52,13 @@ func TestLease_RenewSameOwner(t *testing.T) {
 
 	now := time.Now().UTC()
 	mock.ExpectBegin()
-	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dc-controller", int64(5), now.Add(-5*time.Minute), now.Add(-10*time.Second), "dc-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1 FOR UPDATE").
+	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at"}).
+		AddRow("dc-controller", int64(5), now.Add(-5*time.Minute), now.Add(-10*time.Second))
+	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at FROM keeper.leader WHERE id = 1 FOR UPDATE").
 		WillReturnRows(rows)
 	mock.ExpectExec("UPDATE keeper.leader SET heartbeat_at = NOW").
-		WithArgs("dc-controller").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-
-	refreshed := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dc-controller", int64(5), now.Add(-5*time.Minute), now, "dc-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1").
-		WillReturnRows(refreshed)
 
 	m := &Manager{dsn: "mock", timeout: 2 * time.Second}
 	lease, err := m.runAcquireOrRenew(context.Background(), db, "dc-controller", 30*time.Second)
@@ -79,6 +67,9 @@ func TestLease_RenewSameOwner(t *testing.T) {
 	}
 	if lease.Epoch != 5 {
 		t.Errorf("expected epoch unchanged at 5, got %d", lease.Epoch)
+	}
+	if lease.Owner != "dc-controller" {
+		t.Errorf("expected owner dc-controller, got %q", lease.Owner)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -93,21 +84,15 @@ func TestLease_StaleOwnerTakeover(t *testing.T) {
 
 	stale := time.Now().UTC().Add(-5 * time.Minute) // far past 30s TTL
 	mock.ExpectBegin()
-	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dr-controller", int64(7), stale.Add(-time.Hour), stale, "dr-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1 FOR UPDATE").
+	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at"}).
+		AddRow("dr-controller", int64(7), stale.Add(-time.Hour), stale)
+	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at FROM keeper.leader WHERE id = 1 FOR UPDATE").
 		WillReturnRows(rows)
 	// Takeover with epoch=8
 	mock.ExpectExec("UPDATE keeper.leader SET owner = ?, epoch = ?, acquired_at = NOW").
-		WithArgs("dc-controller", int64(8), "dc-controller").
+		WithArgs("dc-controller", int64(8)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-
-	now := time.Now().UTC()
-	refreshed := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dc-controller", int64(8), now, now, "dc-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1").
-		WillReturnRows(refreshed)
 
 	m := &Manager{dsn: "mock", timeout: 2 * time.Second}
 	lease, err := m.runAcquireOrRenew(context.Background(), db, "dc-controller", 30*time.Second)
@@ -130,9 +115,9 @@ func TestLease_FreshOwnerRefused(t *testing.T) {
 
 	fresh := time.Now().UTC().Add(-2 * time.Second) // well within 30s TTL
 	mock.ExpectBegin()
-	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at", "renewed_by"}).
-		AddRow("dr-controller", int64(12), fresh.Add(-time.Minute), fresh, "dr-controller")
-	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at, renewed_by FROM keeper.leader WHERE id = 1 FOR UPDATE").
+	rows := sqlmock.NewRows([]string{"owner", "epoch", "acquired_at", "heartbeat_at"}).
+		AddRow("dr-controller", int64(12), fresh.Add(-time.Minute), fresh)
+	mock.ExpectQuery("SELECT owner, epoch, acquired_at, heartbeat_at FROM keeper.leader WHERE id = 1 FOR UPDATE").
 		WillReturnRows(rows)
 	mock.ExpectRollback()
 

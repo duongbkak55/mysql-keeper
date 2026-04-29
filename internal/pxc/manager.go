@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -36,6 +37,32 @@ type Manager struct {
 	// crdApplyRetries is how many times to attempt patching isSource on the
 	// PXC CRD before falling back to direct SQL. 0 = SQL-only (legacy default).
 	crdApplyRetries int
+
+	// leaseOnce / leaseDB hold the long-lived connection pool used exclusively
+	// for keeper.leader heartbeats. Lease ops are called on every reconcile
+	// cycle, so a persistent pool avoids TCP setup/teardown overhead.
+	leaseOnce sync.Once
+	leaseDB   *sql.DB
+}
+
+// leasePool returns the long-lived *sql.DB used for keeper.leader operations.
+// Initialized lazily on first call; safe for concurrent use.
+func (m *Manager) leasePool() *sql.DB {
+	m.leaseOnce.Do(func() {
+		// sql.Open never dials — it only validates the DSN and registers the
+		// driver. The actual connection is established on the first query.
+		db, err := sql.Open("mysql", m.dsn)
+		if err != nil {
+			// Unreachable with a registered driver; panic is appropriate.
+			panic(fmt.Sprintf("mysql-keeper: lease pool open: %v", err))
+		}
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(5 * time.Minute)
+		db.SetConnMaxIdleTime(30 * time.Second)
+		m.leaseDB = db
+	})
+	return m.leaseDB
 }
 
 // NewManager creates a Manager for the LOCAL cluster.
