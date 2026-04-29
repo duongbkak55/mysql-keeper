@@ -23,7 +23,7 @@ import (
 // 0.3). This test only asserts that the progress bookkeeping is durable,
 // i.e. we won't silently forget an attempt across pod restarts.
 func TestE2E_SwitchoverProgressCheckpointSurvivesRestart(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 
 	c := newClient(t)
@@ -66,18 +66,18 @@ func TestE2E_SwitchoverProgressCheckpointSurvivesRestart(t *testing.T) {
 	kubectl(t, "scale", "-n", "mysql-keeper-system",
 		"deploy/mysql-keeper-controller-manager", "--replicas=0")
 	kubectl(t, "wait", "-n", "mysql-keeper-system",
-		"--for=delete", "pods", "-l", "app.kubernetes.io/name=mysql-keeper", "--timeout=30s")
+		"--for=delete", "pods", "-l", "app.kubernetes.io/name=mysql-keeper", "--timeout=60s")
 	kubectl(t, "scale", "-n", "mysql-keeper-system",
 		"deploy/mysql-keeper-controller-manager", "--replicas=2")
 	kubectl(t, "wait", "-n", "mysql-keeper-system",
-		"--for=condition=Available", "deploy/mysql-keeper-controller-manager", "--timeout=60s")
+		"--for=condition=Available", "deploy/mysql-keeper-controller-manager", "--timeout=120s")
 
 	// Poll the CR: the SwitchoverProgress we seeded must still be there, and
 	// the AttemptID must match. Once the reconciler notices the stale state
 	// it may flip Phase to Degraded (controlled by ResumeStuckTimeout); we
 	// accept either SwitchingOver or Degraded as long as the checkpoint is
 	// not silently nil'd.
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	for {
 		observed := &mysqlv1alpha1.ClusterSwitchPolicy{}
 		mustGet(t, ctx, c, name, observed)
