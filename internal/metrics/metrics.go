@@ -217,4 +217,18 @@ func init() {
 		GTIDMissingTransactions,
 		ReplicationLagSeconds,
 	)
+
+	// Pre-seed GaugeVec label combinations so every process exposes the
+	// mysql_keeper_* series from startup. Prometheus GaugeVec only emits a
+	// series in /metrics after the first WithLabelValues().Set() call; without
+	// this, pods that haven't yet reconciled any CSP (e.g. standby replicas)
+	// would return no keeper metrics at all.
+	for _, role := range []string{"dc", "dr"} {
+		for _, scope := range []string{"local", "remote"} {
+			ClusterHealthy.WithLabelValues(role, scope).Set(0)
+			ClusterWritable.WithLabelValues(role, scope).Set(0)
+			ConsecutiveFailures.WithLabelValues(role, scope).Set(0)
+		}
+		ProxySQLHealthyInstances.WithLabelValues(role).Set(0)
+	}
 }
