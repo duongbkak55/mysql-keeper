@@ -38,8 +38,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
 	"github.com/duongnguyen/mysql-keeper/internal/health"
@@ -1086,8 +1088,23 @@ func (r *ClusterSwitchPolicyReconciler) handleDegradedRecovery(
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterSwitchPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Filter watch events so that status-subresource patches (which do not
+	// bump .metadata.generation and do not change annotations) do not
+	// re-trigger an immediate reconcile. Without this filter every
+	// Status().Patch() call causes a watch event → new reconcile → new
+	// Status().Patch(), creating a tight loop that fires far faster than
+	// spec.healthCheck.interval.
+	//
+	// GenerationChangedPredicate passes spec changes (generation bump).
+	// AnnotationChangedPredicate passes annotation writes, which is how
+	// the recover-degraded manual trigger is delivered.
+	// RequeueAfter in the reconcile return drives the periodic cadence.
+	p := predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+	)
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mysqlv1alpha1.ClusterSwitchPolicy{}).
+		For(&mysqlv1alpha1.ClusterSwitchPolicy{}, builder.WithPredicates(p)).
 		Complete(r)
 }
 
