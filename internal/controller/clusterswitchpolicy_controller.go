@@ -280,6 +280,17 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	logger = logger.WithValues("attemptID", attemptID, "reason", reason)
 	logger.Info("Starting switchover attempt")
 
+	// If the operator requested a manual switchover while the replica is
+	// quarantined, refuse it up-front — do NOT clear the trigger so they
+	// don't have to re-set it after releasing quarantine.
+	if policy.Spec.ManualSwitchoverTarget != "" && replicaQuarantined(policy) {
+		if r.Recorder != nil {
+			r.Recorder.Event(policy, corev1.EventTypeWarning, "ManualSwitchoverRefused",
+				"manual switchover requested but replica is quarantined — clear quarantine first")
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// Clear the manual trigger BEFORE we run the switchover. If we left it set
 	// and the attempt failed, the next reconcile would see the trigger again
 	// and re-enter Execute — exactly the ping-pong we want to avoid. The

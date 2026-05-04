@@ -434,7 +434,7 @@ func whyClearRefused(
 	now time.Time,
 ) string {
 	if out.ActiveError != nil {
-		return fmt.Sprintf("active SQL applier error errno=%d still firing on channel %q",
+		return fmt.Sprintf("active SQL applier error errno=%d present at start of this reconcile cycle on channel %q — retry after next reconcile if skip resolved it",
 			out.ActiveError.Errno, out.ActiveError.Channel)
 	}
 	count := countSkipsInWindow(historicalSkips(policy), out.Skipped,

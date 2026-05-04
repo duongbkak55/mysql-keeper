@@ -192,7 +192,7 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	// prior cycle but is absent from currentLabels must be zeroed. This
 	// prevents stale "errno=X → 1" series from lingering after the error
 	// rotates to a different errno or clears entirely.
-	uidPrefix := uid + ":"
+	uidPrefix := uid + "\x00"
 	r.activeReplicationErrorLabels.Range(func(k, _ any) bool {
 		key := k.(string)
 		if !strings.HasPrefix(key, uidPrefix) {
@@ -403,43 +403,35 @@ func effectiveReplicationErrorHandling(
 // pruneSkipsByRetention drops entries older than `retention` from history.
 // Returns history unchanged when retention <= 0 (caller opted out of
 // time-based pruning). Stable order preserved.
+//
+// The filter is order-independent: it walks every entry and keeps those
+// whose SkippedAt is at or after the cutoff. This is correct even when
+// clock skew or future code paths insert a fresh entry before a stale one.
+// history[:0:0] forces a fresh backing array so the returned slice never
+// aliases the input (M2 fix).
 func pruneSkipsByRetention(
 	history []mysqlv1alpha1.SkippedTransaction,
 	retention time.Duration,
 	now time.Time,
 ) []mysqlv1alpha1.SkippedTransaction {
-	if retention <= 0 || len(history) == 0 {
+	if retention <= 0 {
 		return history
 	}
 	cutoff := now.Add(-retention)
-	// Find the first index whose timestamp is at or after cutoff. History
-	// is appended in chronological order, so a single linear scan suffices.
-	keepFrom := 0
-	for i, e := range history {
+	kept := history[:0:0] // fresh backing array, cap=0; never aliases history
+	for _, e := range history {
 		if !e.SkippedAt.Time.Before(cutoff) {
-			keepFrom = i
-			break
+			kept = append(kept, e)
 		}
-		// All entries scanned so far are too old; if the loop ends without
-		// finding any kept entry, keepFrom stays at len(history) below.
-		keepFrom = i + 1
 	}
-	if keepFrom == 0 {
-		return history
-	}
-	if keepFrom >= len(history) {
-		return nil
-	}
-	pruned := make([]mysqlv1alpha1.SkippedTransaction, len(history)-keepFrom)
-	copy(pruned, history[keepFrom:])
-	return pruned
+	return kept
 }
 
 // appendSkipsCapped appends entries to history, oldest-first, and returns the
 // most-recent `cap` entries. Stable order preserved across reconciles.
 func appendSkipsCapped(history []mysqlv1alpha1.SkippedTransaction,
 	entries []mysqlv1alpha1.SkippedTransaction, capN int) []mysqlv1alpha1.SkippedTransaction {
-	combined := append(history, entries...)
+	combined := append(append([]mysqlv1alpha1.SkippedTransaction(nil), history...), entries...)
 	if len(combined) <= capN {
 		return combined
 	}
@@ -449,29 +441,25 @@ func appendSkipsCapped(history []mysqlv1alpha1.SkippedTransaction,
 // replicationErrorLabelKey encodes the four label dimensions into a single
 // string key used by activeReplicationErrorLabels. Format:
 //
-//	"<policyUID>:<role>:<channel>:<errno>"
+//	"<policyUID>\x00<role>\x00<channel>\x00<errno>"
 //
-// None of the fields contain ":" in practice (UIDs use "-", role is "dc"/"dr",
-// channel names do not use ":", errno is a decimal integer), so simple
-// splitting is safe.
+// NUL (\x00) is used as the separator because it is valid in Go map keys but
+// can never appear in a MySQL identifier (channel name) or UUID, making the
+// key unambiguous even when a channel name contains ":" (which is valid in
+// MySQL but would corrupt a colon-separated key).
 func replicationErrorLabelKey(uid, role, channel, errnoStr string) string {
-	return uid + ":" + role + ":" + channel + ":" + errnoStr
+	return uid + "\x00" + role + "\x00" + channel + "\x00" + errnoStr
 }
 
 // parseReplicationErrorLabelKey is the inverse of replicationErrorLabelKey.
 // It returns (uid, role, channel, errnoStr, ok). ok is false only when the
-// key does not have the expected number of colon-delimited segments.
+// key does not have the expected number of NUL-delimited segments.
 //
-// UIDs are UUID-format and contain hyphens but no colons, so splitting on ":"
-// with a fixed field count is safe. We split into exactly 4 parts by limiting
-// the split to n=4 so that channel names containing ":" (non-standard but
-// theoretically possible) are still handled correctly — they would land in the
-// channel segment. In practice MySQL channel names are alphanumeric+hyphen.
+// NUL (\x00) cannot appear in MySQL identifiers or UUIDs, so a simple
+// SplitN with n=4 always produces exactly the four encoded fields regardless
+// of whether the channel name contains ":" or other punctuation.
 func parseReplicationErrorLabelKey(key string) (uid, role, channel, errnoStr string, ok bool) {
-	// UID is a UUID (8-4-4-4-12 hex with hyphens) — contains no colons.
-	// Format: uid:role:channel:errno  → 4 colon-separated fields minimum.
-	// We split on ":" at most 4 times to preserve any colons inside channel.
-	parts := strings.SplitN(key, ":", 4)
+	parts := strings.SplitN(key, "\x00", 4)
 	if len(parts) != 4 {
 		return "", "", "", "", false
 	}

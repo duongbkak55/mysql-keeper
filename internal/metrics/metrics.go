@@ -224,8 +224,8 @@ var (
 	)
 
 	// ReplicationSkipBlockedTotal counts cases where a skip-eligible error was
-	// detected but skip was suppressed. Reason ∈ {not_whitelisted, rate_limited,
-	// dry_run, quarantined, disabled, missing_gtid, not_leader}.
+	// detected but skip was suppressed. Reason ∈ {disabled, not_whitelisted,
+	// rate_limited, dry_run, quarantined, missing_gtid, unsupported_inspector}.
 	// Labels: cluster_role, reason
 	ReplicationSkipBlockedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -317,5 +317,21 @@ func init() {
 		}
 		ProxySQLHealthyInstances.WithLabelValues(role).Set(0)
 		ReplicaQuarantined.WithLabelValues(role).Set(0)
+	}
+
+	// Pre-seed counter metrics so dashboards show "0" instead of "no data"
+	// for well-known label combinations from process startup.
+	for _, role := range []string{"dc", "dr"} {
+		// errno is dynamic (per MySQL error number); seed a blank sentinel so
+		// the series exists. Dynamic errno values will appear on first use.
+		ReplicationSkipFailedTotal.WithLabelValues(role, "").Add(0)
+
+		for _, reason := range []string{"active_error", "burst_in_window"} {
+			QuarantineClearRefusedTotal.WithLabelValues(role, reason).Add(0)
+		}
+
+		for _, reason := range []string{"disabled", "not_whitelisted", "rate_limited", "dry_run", "quarantined", "missing_gtid", "unsupported_inspector"} {
+			ReplicationSkipBlockedTotal.WithLabelValues(role, reason).Add(0)
+		}
 	}
 }

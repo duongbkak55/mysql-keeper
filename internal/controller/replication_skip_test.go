@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
+	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
 // fakeSkipper records every SkipNextTransaction call and optionally returns
@@ -305,6 +306,68 @@ func TestApplyAutoSkip_SkipperError(t *testing.T) {
 	}
 	if len(out.Skipped) != 0 {
 		t.Errorf("expected 0 successful skips on SQL failure, got %v", out.Skipped)
+	}
+}
+
+// nonSkippingInspector satisfies switchover.ReplicationInspector but does NOT
+// implement replicationSkipper (no SkipNextTransaction method). Used to
+// exercise the unsupported_inspector blocker branch in applyAutoSkip.
+type nonSkippingInspector struct{}
+
+func (nonSkippingInspector) GetGTIDSnapshot(_ context.Context) (pxc.GTIDSnapshot, error) {
+	return pxc.GTIDSnapshot{}, nil
+}
+func (nonSkippingInspector) GetExecutedGTID(_ context.Context) (string, error)  { return "", nil }
+func (nonSkippingInspector) IsGTIDSubset(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+func (nonSkippingInspector) MissingGTIDs(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (nonSkippingInspector) WaitForGTID(_ context.Context, _ string, _ time.Duration) error {
+	return nil
+}
+func (nonSkippingInspector) GetReplicationStatus(_ context.Context, _ string) (pxc.ReplicationStatus, error) {
+	return pxc.ReplicationStatus{}, nil
+}
+func (nonSkippingInspector) ProbeReachable(_ context.Context, _ time.Duration) (bool, error) {
+	return true, nil
+}
+
+// TestApplyAutoSkip_UnsupportedInspector covers the blocker path where
+// localInspector is non-nil but does not implement replicationSkipper.
+// applyAutoSkip must type-assert to nil and increment
+// out.SkipBlocked["unsupported_inspector"] without touching out.Skipped.
+func TestApplyAutoSkip_UnsupportedInspector(t *testing.T) {
+	policy := newPolicyWithSkipConfig(mysqlv1alpha1.AutoSkipConfig{
+		Enabled:                 true,
+		ErrorCodeWhitelist:      []int32{1062},
+		MaxSkipsPerWindow:       3,
+		Window:                  metav1.Duration{Duration: 10 * time.Minute},
+		MaxSkipBeforeQuarantine: 5,
+		QuarantineWindow:        metav1.Duration{Duration: time.Hour},
+	})
+	cfg := effectiveReplicationErrorHandling(policy)
+	out := &replicationErrorOutcome{
+		AllErrors: []mysqlv1alpha1.ReplicationErrorEntry{
+			errEntry(1062, "abc:1"),
+			errEntry(1062, "abc:2"),
+		},
+		SkipBlocked: map[string]int{},
+	}
+	r := &ClusterSwitchPolicyReconciler{}
+
+	// nonSkippingInspector satisfies switchover.ReplicationInspector but
+	// has no SkipNextTransaction — the type assertion in applyAutoSkip
+	// will yield skipper==nil, triggering the unsupported_inspector branch.
+	comps := &componentSet{localInspector: nonSkippingInspector{}}
+	r.applyAutoSkip(context.Background(), policy, comps, cfg, out)
+
+	if got := out.SkipBlocked["unsupported_inspector"]; got == 0 {
+		t.Errorf("expected unsupported_inspector blocker > 0, got %d (full map: %v)", got, out.SkipBlocked)
+	}
+	if len(out.Skipped) != 0 {
+		t.Errorf("expected Skipped to be empty, got %v", out.Skipped)
 	}
 }
 

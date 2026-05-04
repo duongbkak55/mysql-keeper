@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/duongnguyen/mysql-keeper/internal/proxysql"
+	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
 // recordingProxy is a ProxySQLManager test double that records calls for
@@ -510,6 +511,82 @@ func TestEngine_RoutingFailRollsBackPromoteAndFence(t *testing.T) {
 	// double-apply the original routing on instances that never changed).
 	if proxy.BackCalls() != 0 {
 		t.Errorf("expected no RollbackRouting call on failed Apply, got %d", proxy.BackCalls())
+	}
+}
+
+// TestEngine_QuarantineFailsPreFlight verifies the C12 guard: when
+// cfg.LocalReplicaQuarantined is true, Execute must return immediately with
+// Success=false and FailedPhase=PhasePreFlight — no Fence, Promote, or routing
+// changes must occur. A future refactor that removes checkReplicaNotQuarantined
+// from PreFlight.Run should cause this test to fail.
+func TestEngine_QuarantineFailsPreFlight(t *testing.T) {
+	// Remote is read-only and fully caught up so every other preflight check
+	// passes — C12 is the only thing that should block the switchover.
+	gtid := "dc:1-100"
+	local := &stubPXC{writable: true}
+	remote := &stubPXC{writable: false}
+	inspector := &fakeInspector{
+		snapshot: goodSnapshot(gtid),
+		repStatus: pxc.ReplicationStatus{
+			ChannelName:     "dc-to-dr",
+			ConfigExists:    true,
+			IOServiceState:  "ON",
+			SQLServiceState: "ON",
+		},
+	}
+	proxy := &recordingProxy{}
+	reporter := &recordingReporter{}
+
+	e := NewEngine(Config{
+		LocalPXC:                local,
+		RemotePXC:               remote,
+		LocalInspector:          inspector,
+		RemoteInspector:         inspector,
+		LocalProxySQL:           proxy,
+		LocalReplicationChannel: "dc-to-dr",
+		FenceTimeout:            time.Second,
+		Progress:                reporter,
+		LocalReplicaQuarantined: true,
+		LocalQuarantineReason:   "auto-skip threshold exceeded (5/3)",
+	})
+
+	res := e.Execute(context.Background())
+
+	if res.Success {
+		t.Fatal("expected Execute to fail when replica is quarantined")
+	}
+	if res.FailedPhase != PhasePreFlight {
+		t.Errorf("expected FailedPhase=PreFlight, got %s", res.FailedPhase)
+	}
+	// C12 must be present, failed, and mention quarantine.
+	if res.PreFlight == nil {
+		t.Fatal("expected res.PreFlight to be populated")
+	}
+	foundC12 := false
+	for _, c := range res.PreFlight.Checks {
+		if c.Name != "C12_ReplicaNotQuarantined" {
+			continue
+		}
+		foundC12 = true
+		if c.Passed {
+			t.Errorf("expected C12_ReplicaNotQuarantined to be failed, but it passed")
+		}
+		if !strings.Contains(strings.ToLower(c.Message), "quarantine") {
+			t.Errorf("expected C12 failure message to mention quarantine; got: %q", c.Message)
+		}
+	}
+	if !foundC12 {
+		t.Error("expected C12_ReplicaNotQuarantined check to appear in PreFlightResult")
+	}
+	// No state mutations must have occurred.
+	if local.setReadOnlyCalls.Load() != 0 {
+		t.Errorf("Fence must not be reached; SetReadOnly called %d time(s)", local.setReadOnlyCalls.Load())
+	}
+	if remote.setReadWriteCalls.Load() != 0 {
+		t.Errorf("Promote must not be reached; SetReadWrite called %d time(s)", remote.setReadWriteCalls.Load())
+	}
+	if proxy.ApplyCalls() != 0 {
+		t.Errorf("Routing must not be reached; ApplyCalls=%d", proxy.ApplyCalls())
 	}
 }
 

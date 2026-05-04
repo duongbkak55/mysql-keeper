@@ -396,7 +396,13 @@ func (m *Manager) SkipNextTransaction(ctx context.Context, channel, gtid string)
 		return err
 	}
 	defer db.Close()
+	return m.runSkipNextTransaction(ctx, db, channel, gtid)
+}
 
+// runSkipNextTransaction is the DB-operations core of SkipNextTransaction,
+// split out so tests can inject a sqlmock-backed *sql.DB without going
+// through openDB (which dials a real MySQL server).
+func (m *Manager) runSkipNextTransaction(ctx context.Context, db *sql.DB, channel, gtid string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire conn for skip: %w", err)
@@ -428,7 +434,7 @@ func (m *Manager) SkipNextTransaction(ctx context.Context, channel, gtid string)
 	// leave the connection's gtid_next session variable set to the failed
 	// GTID when the conn returns to the pool.
 	restoreApplier := func(orig error) error {
-		recoverCtx, recoverCancel := context.WithTimeout(ctx, m.timeout)
+		recoverCtx, recoverCancel := context.WithTimeout(context.WithoutCancel(ctx), m.timeout)
 		defer recoverCancel()
 		if _, e := conn.ExecContext(recoverCtx, resetNext); e != nil {
 			orig = fmt.Errorf("%w; cleanup reset gtid_next failed: %v", orig, e)
@@ -448,7 +454,10 @@ func (m *Manager) SkipNextTransaction(ctx context.Context, channel, gtid string)
 		return restoreApplier(fmt.Errorf("BEGIN: %w", err))
 	}
 	if _, err := conn.ExecContext(qCtx, "COMMIT"); err != nil {
-		return restoreApplier(fmt.Errorf("COMMIT: %w", err))
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), m.timeout)
+		_, _ = conn.ExecContext(rollbackCtx, "ROLLBACK")
+		rollbackCancel()
+		return restoreApplier(fmt.Errorf("commit empty txn for gtid %s: %w", gtid, err))
 	}
 	if _, err := conn.ExecContext(qCtx, resetNext); err != nil {
 		return restoreApplier(fmt.Errorf("SET gtid_next AUTOMATIC: %w", err))

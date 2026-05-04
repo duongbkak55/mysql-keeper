@@ -420,3 +420,133 @@ func TestUpdateReplicationErrorStatus_QuarantineTransitions(t *testing.T) {
 			policy.Status.ReplicationErrors.QuarantinedSince)
 	}
 }
+
+// TestReplicationErrorPipeline_SkipAndRecover exercises the full three-stage
+// pipeline — observeReplicationErrors → applyAutoSkipWith →
+// updateReplicationErrorStatus — in two consecutive reconcile cycles:
+//
+// Cycle 1: a 1062 error is detected, auto-skip fires, status is patched.
+// Cycle 2: the error clears, status heals (LastError nil, condition True).
+func TestReplicationErrorPipeline_SkipAndRecover(t *testing.T) {
+	const (
+		role    = "dc"
+		channel = "dc-to-dr"
+	)
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Build a policy with auto-skip enabled for errno 1062 and a large enough
+	// rate-limit window so the skip is never blocked on the first cycle.
+	policy := &mysqlv1alpha1.ClusterSwitchPolicy{
+		Spec: mysqlv1alpha1.ClusterSwitchPolicySpec{
+			ClusterRole:            role,
+			ReplicationChannelName: channel,
+			ReplicationErrorHandling: &mysqlv1alpha1.ReplicationErrorHandlingConfig{
+				AutoSkip: mysqlv1alpha1.AutoSkipConfig{
+					Enabled:            true,
+					ErrorCodeWhitelist: []int32{1062},
+					MaxSkipsPerWindow:  10,
+					Window:             metav1.Duration{Duration: time.Hour},
+					HistoryRetention:   metav1.Duration{Duration: 24 * time.Hour},
+				},
+			},
+		},
+	}
+
+	// ── Cycle 1: error detected, skip applied ──────────────────────────────
+
+	// fakeInspectorDetector with a 1062 error on the configured channel.
+	det1 := &fakeInspectorDetector{
+		fakeDetector: fakeDetector{
+			errs: []pxc.WorkerError{
+				{
+					Channel:    channel,
+					WorkerID:   1,
+					Errno:      1062,
+					Message:    "Duplicate entry '1' for key 'PRIMARY'",
+					FailedGTID: "aaaaaaaa-0000-0000-0000-000000000001:42",
+					Timestamp:  now,
+				},
+			},
+		},
+	}
+	comps1 := &componentSet{localInspector: det1}
+	skipper1 := &fakeSkipper{}
+
+	r := &ClusterSwitchPolicyReconciler{}
+	cfg := effectiveReplicationErrorHandling(policy)
+
+	// Step 1: observe — auto-skip inside observeReplicationErrors is disabled
+	// because we pass nil for comps so the internal applyAutoSkip is skipped,
+	// then we re-call with real comps but without auto-skip triggering via
+	// the replicationSkipper interface mismatch.
+	// Instead, call observeReplicationErrors with a skipper-less component set
+	// so the internal applyAutoSkip gets an unsupported_inspector block, then
+	// call applyAutoSkipWith directly with the real fakeSkipper.
+	out := r.observeReplicationErrors(context.Background(), policy, comps1, 0, false)
+
+	// Step 2: apply skip explicitly (the testable inner path).
+	r.applyAutoSkipWith(context.Background(), policy, skipper1, cfg, &out, now)
+
+	// Step 3: patch status.
+	updateReplicationErrorStatus(policy, out, now)
+
+	// ── Cycle 1 assertions ──────────────────────────────────────────────────
+
+	if policy.Status.ReplicationErrors == nil {
+		t.Fatal("cycle 1: expected ReplicationErrors to be populated")
+	}
+	if n := len(policy.Status.ReplicationErrors.SkippedTransactions); n != 1 {
+		t.Errorf("cycle 1: want 1 SkippedTransaction, got %d", n)
+	}
+	if policy.Status.ReplicationErrors.LastError == nil {
+		t.Fatal("cycle 1: expected LastError to be non-nil")
+	}
+	if policy.Status.ReplicationErrors.LastError.Errno != 1062 {
+		t.Errorf("cycle 1: want LastError.Errno=1062, got %d",
+			policy.Status.ReplicationErrors.LastError.Errno)
+	}
+	cond1 := meta.FindStatusCondition(policy.Status.Conditions,
+		mysqlv1alpha1.ConditionReplicationHealthy)
+	if cond1 == nil || cond1.Status != metav1.ConditionFalse {
+		t.Errorf("cycle 1: want ReplicationHealthy=False, got %+v", cond1)
+	}
+	if len(skipper1.calls) != 1 {
+		t.Errorf("cycle 1: want 1 SkipNextTransaction call, got %d", len(skipper1.calls))
+	}
+
+	// ── Cycle 2: error cleared, status heals ──────────────────────────────
+
+	now2 := now.Add(time.Minute)
+
+	// Detector returns no errors this cycle.
+	det2 := &fakeInspectorDetector{fakeDetector: fakeDetector{errs: nil}}
+	comps2 := &componentSet{localInspector: det2}
+
+	out2 := r.observeReplicationErrors(context.Background(), policy, comps2, 0, false)
+
+	// applyAutoSkipWith with no errors is a no-op for skipping, but
+	// evaluateQuarantine still runs (no quarantine expected here).
+	r.applyAutoSkipWith(context.Background(), policy, skipper1, cfg, &out2, now2)
+
+	updateReplicationErrorStatus(policy, out2, now2)
+
+	// ── Cycle 2 assertions ──────────────────────────────────────────────────
+
+	if policy.Status.ReplicationErrors == nil {
+		t.Fatal("cycle 2: expected ReplicationErrors to still be present")
+	}
+	// SkippedTransactions must be preserved across cycles (written in cycle 1,
+	// not pruned because HistoryRetention is 24 h and only 1 minute elapsed).
+	if n := len(policy.Status.ReplicationErrors.SkippedTransactions); n != 1 {
+		t.Errorf("cycle 2: want 1 SkippedTransaction preserved, got %d", n)
+	}
+	if policy.Status.ReplicationErrors.LastError != nil {
+		t.Errorf("cycle 2: want LastError=nil after recovery, got %+v",
+			policy.Status.ReplicationErrors.LastError)
+	}
+	cond2 := meta.FindStatusCondition(policy.Status.Conditions,
+		mysqlv1alpha1.ConditionReplicationHealthy)
+	if cond2 == nil || cond2.Status != metav1.ConditionTrue {
+		t.Errorf("cycle 2: want ReplicationHealthy=True after recovery, got %+v", cond2)
+	}
+}
