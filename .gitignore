@@ -3,3 +3,5 @@
 bin/
 preflight-cli
 preflight-cli.exe
+# Intermediate artifacts from docs build (mermaid PNGs, rendered md, scripts)
+docs/.build/
