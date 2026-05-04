@@ -361,6 +361,8 @@ Key metrics:
 - `mysql_keeper_replication_skipped_total{cluster_role,errno}` — auto-skipped transactions counter
 - `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}` — would-be skips that were blocked (`not_whitelisted` / `rate_limited` / `dry_run` / `quarantined`)
 - `mysql_keeper_replica_quarantined{cluster_role}` — 1 when PreFlight C12 is blocking promote
+- `mysql_keeper_replication_skip_failed_total{cluster_role,errno}` — SkipNextTransaction SQL flow returned an error
+- `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` — clear-quarantine annotation refused (`active_error` / `burst_in_window`)
 
 ---
 

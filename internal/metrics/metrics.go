@@ -247,6 +247,34 @@ var (
 		},
 		[]string{"cluster_role"},
 	)
+
+	// ReplicationSkipFailedTotal counts SkipNextTransaction calls that
+	// returned an error (the SQL flow STOP REPLICA / SET gtid_next /
+	// BEGIN+COMMIT / START REPLICA failed mid-flight). Useful to alert
+	// "auto-skip is broken" — the skip path itself has a bug or the
+	// MySQL server rejected the recipe.
+	// Labels: cluster_role, errno
+	ReplicationSkipFailedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replication_skip_failed_total",
+			Help:      "Number of SkipNextTransaction SQL flows that returned an error.",
+		},
+		[]string{"cluster_role", "errno"},
+	)
+
+	// QuarantineClearRefusedTotal counts how many times an operator-supplied
+	// clear-quarantine annotation was refused because preconditions were
+	// not met (active error still firing or burst still in window).
+	// Labels: cluster_role, reason ∈ {active_error, burst_in_window}
+	QuarantineClearRefusedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mysql_keeper",
+			Name:      "quarantine_clear_refused_total",
+			Help:      "Number of clear-quarantine annotation requests refused, by reason.",
+		},
+		[]string{"cluster_role", "reason"},
+	)
 )
 
 func init() {
@@ -272,6 +300,8 @@ func init() {
 		ReplicationSkippedTotal,
 		ReplicationSkipBlockedTotal,
 		ReplicaQuarantined,
+		ReplicationSkipFailedTotal,
+		QuarantineClearRefusedTotal,
 	)
 
 	// Pre-seed GaugeVec label combinations so every process exposes the

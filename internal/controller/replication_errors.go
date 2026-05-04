@@ -229,6 +229,11 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 			"channel", channel,
 			"reason", out.QuarantineReason,
 		)
+		if r.Recorder != nil {
+			r.Recorder.Event(policy, corev1.EventTypeWarning, "ReplicaQuarantined",
+				fmt.Sprintf("local replica quarantined: %s — clear via annotation %s before promote",
+					out.QuarantineReason, mysqlv1alpha1.AnnotationClearQuarantine))
+		}
 	case wasQuarantined && !out.QuarantineActive:
 		val := policy.Annotations[mysqlv1alpha1.AnnotationClearQuarantine]
 		logger.Info("replica_quarantine_cleared",

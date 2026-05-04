@@ -11,8 +11,8 @@ divergence.
 | Surface | Where it shows up |
 |---|---|
 | `kubectl describe csp <name>` | Conditions `ReplicationHealthy`, `ReplicaQuarantined` + status field `replicationErrors` (last error, skip history, quarantine state) |
-| K8s events | `ReplicationSQLError`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ReplicaQuarantineCleared`, `GTIDGapHigh` |
-| Prometheus | `mysql_keeper_replication_error{cluster_role,channel,errno}`, `mysql_keeper_replication_skipped_total{cluster_role,errno}`, `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}`, `mysql_keeper_replica_quarantined{cluster_role}` |
+| K8s events | `ReplicationSQLError`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ReplicaQuarantined`, `ReplicaQuarantineCleared`, `ClearQuarantineRefused`, `GTIDGapHigh` |
+| Prometheus | `mysql_keeper_replication_error{cluster_role,channel,errno}`, `mysql_keeper_replication_skipped_total{cluster_role,errno}`, `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}`, `mysql_keeper_replication_skip_failed_total{cluster_role,errno}`, `mysql_keeper_replica_quarantined{cluster_role}`, `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` |
 | PreFlight | New hard check **C12_ReplicaNotQuarantined** blocks promote while quarantined |
 
 ## How detection works

@@ -232,6 +232,8 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		}
 
 		if err := skipper.SkipNextTransaction(ctx, channel, gtid); err != nil {
+			metrics.ReplicationSkipFailedTotal.WithLabelValues(role,
+				strconv.FormatInt(int64(errno), 10)).Inc()
 			logger.Error(err, "replication_skip_failed",
 				"event", "replication_skip_failed",
 				"cluster_role", role,
@@ -356,6 +358,12 @@ func evaluateQuarantine(
 		// one-shot warning event for visibility.
 		out.RefusedClearAnnotation = policy.Annotations[mysqlv1alpha1.AnnotationClearQuarantine]
 		out.RefusedClearReason = whyClearRefused(policy, cfg, out, now)
+		reasonLabel := "burst_in_window"
+		if out.ActiveError != nil {
+			reasonLabel = "active_error"
+		}
+		metrics.QuarantineClearRefusedTotal.WithLabelValues(
+			policy.Spec.ClusterRole, reasonLabel).Inc()
 		if recorder != nil {
 			recorder.Event(policy, "Warning", "ClearQuarantineRefused",
 				"clear-quarantine annotation refused: "+out.RefusedClearReason)
