@@ -116,3 +116,4 @@ spec:
       window: 10m
       maxSkipBeforeQuarantine: 5
       quarantineWindow: 1h
+      historyRetention: 168h

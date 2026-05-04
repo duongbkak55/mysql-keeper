@@ -161,3 +161,8 @@ spec:
       # until the operator clears it via annotation.
       maxSkipBeforeQuarantine: 5
       quarantineWindow: 1h
+      # historyRetention: how long status.replicationErrors.skippedTransactions
+      # entries are kept before being pruned. 0 disables time-based pruning
+      # (only the 50-entry cap applies). 7 days mirrors the recommended binlog
+      # retention so audit history aligns with what MySQL itself can replay.
+      historyRetention: 168h

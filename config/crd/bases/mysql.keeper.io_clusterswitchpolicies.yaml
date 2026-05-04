@@ -568,6 +568,16 @@ spec:
                           format: int32
                           type: integer
                         type: array
+                      historyRetention:
+                        default: 168h
+                        description: |-
+                          HistoryRetention is how long an entry stays in
+                          status.replicationErrors.skippedTransactions before being pruned.
+                          Independent of the 50-entry cap: pruning happens before the cap is
+                          applied, so a long retention with few skips keeps every entry while a
+                          flood with short retention drops oldest entries faster than the cap
+                          alone would. Set to 0 to disable time-based pruning (cap-only).
+                        type: string
                       maxSkipBeforeQuarantine:
                         default: 5
                         description: |-

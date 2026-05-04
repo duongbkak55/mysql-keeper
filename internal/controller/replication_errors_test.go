@@ -109,6 +109,53 @@ func TestAppendSkipsCapped_BelowCap_AppendsAll(t *testing.T) {
 	}
 }
 
+// TestPruneSkipsByRetention_DropsOlderThanCutoff verifies entries older than
+// retention are dropped while newer ones (and the entry exactly at cutoff)
+// are kept.
+func TestPruneSkipsByRetention_DropsOlderThanCutoff(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	hist := []mysqlv1alpha1.SkippedTransaction{
+		{GTID: "g1", SkippedAt: metav1.NewTime(now.Add(-10 * 24 * time.Hour))}, // too old
+		{GTID: "g2", SkippedAt: metav1.NewTime(now.Add(-8 * 24 * time.Hour))},  // too old
+		{GTID: "g3", SkippedAt: metav1.NewTime(now.Add(-7 * 24 * time.Hour))},  // boundary keep
+		{GTID: "g4", SkippedAt: metav1.NewTime(now.Add(-1 * 24 * time.Hour))},  // keep
+		{GTID: "g5", SkippedAt: metav1.NewTime(now)},                          // keep
+	}
+	out := pruneSkipsByRetention(hist, 7*24*time.Hour, now)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 kept, got %d (%+v)", len(out), out)
+	}
+	if out[0].GTID != "g3" || out[2].GTID != "g5" {
+		t.Errorf("expected g3..g5 kept in order, got %v", out)
+	}
+}
+
+// TestPruneSkipsByRetention_AllStale empties the slice when every entry is
+// older than retention.
+func TestPruneSkipsByRetention_AllStale(t *testing.T) {
+	now := time.Now()
+	hist := []mysqlv1alpha1.SkippedTransaction{
+		{GTID: "g1", SkippedAt: metav1.NewTime(now.Add(-30 * 24 * time.Hour))},
+		{GTID: "g2", SkippedAt: metav1.NewTime(now.Add(-20 * 24 * time.Hour))},
+	}
+	out := pruneSkipsByRetention(hist, 7*24*time.Hour, now)
+	if len(out) != 0 {
+		t.Errorf("expected empty slice, got %v", out)
+	}
+}
+
+// TestPruneSkipsByRetention_RetentionZero is a no-op (caller opted out).
+func TestPruneSkipsByRetention_RetentionZero(t *testing.T) {
+	now := time.Now()
+	hist := []mysqlv1alpha1.SkippedTransaction{
+		{GTID: "g1", SkippedAt: metav1.NewTime(now.Add(-30 * 24 * time.Hour))},
+	}
+	out := pruneSkipsByRetention(hist, 0, now)
+	if len(out) != 1 || out[0].GTID != "g1" {
+		t.Errorf("expected unchanged history, got %v", out)
+	}
+}
+
 // TestAppendSkipsCapped_OverCap_DropsOldest verifies the cap drops oldest
 // entries first, preserving most-recent ordering.
 func TestAppendSkipsCapped_OverCap_DropsOldest(t *testing.T) {

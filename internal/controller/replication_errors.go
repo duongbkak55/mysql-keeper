@@ -228,6 +228,13 @@ func updateReplicationErrorStatus(
 		cur = &mysqlv1alpha1.ReplicationErrorStatus{}
 	}
 	cur.LastError = out.ActiveError
+	// Prune entries older than HistoryRetention before this cycle's appends
+	// so the time-based bound holds even when no new skip lands. Cap at 50
+	// entries afterwards so a flood within retention still cannot grow the
+	// list unbounded.
+	cfg := effectiveReplicationErrorHandling(policy)
+	cur.SkippedTransactions = pruneSkipsByRetention(cur.SkippedTransactions,
+		cfg.AutoSkip.HistoryRetention.Duration, now)
 	if len(out.Skipped) > 0 {
 		cur.SkippedTransactions = appendSkipsCapped(cur.SkippedTransactions, out.Skipped, 50)
 	}
@@ -338,7 +345,48 @@ func effectiveReplicationErrorHandling(
 	if out.AutoSkip.QuarantineWindow.Duration <= 0 {
 		out.AutoSkip.QuarantineWindow.Duration = time.Hour
 	}
+	if out.AutoSkip.HistoryRetention.Duration <= 0 {
+		// 7 days mirrors the kubebuilder default and the recommended
+		// minimum binlog retention; keeps audit history aligned with what
+		// MySQL itself can replay.
+		out.AutoSkip.HistoryRetention.Duration = 7 * 24 * time.Hour
+	}
 	return out
+}
+
+// pruneSkipsByRetention drops entries older than `retention` from history.
+// Returns history unchanged when retention <= 0 (caller opted out of
+// time-based pruning). Stable order preserved.
+func pruneSkipsByRetention(
+	history []mysqlv1alpha1.SkippedTransaction,
+	retention time.Duration,
+	now time.Time,
+) []mysqlv1alpha1.SkippedTransaction {
+	if retention <= 0 || len(history) == 0 {
+		return history
+	}
+	cutoff := now.Add(-retention)
+	// Find the first index whose timestamp is at or after cutoff. History
+	// is appended in chronological order, so a single linear scan suffices.
+	keepFrom := 0
+	for i, e := range history {
+		if !e.SkippedAt.Time.Before(cutoff) {
+			keepFrom = i
+			break
+		}
+		// All entries scanned so far are too old; if the loop ends without
+		// finding any kept entry, keepFrom stays at len(history) below.
+		keepFrom = i + 1
+	}
+	if keepFrom == 0 {
+		return history
+	}
+	if keepFrom >= len(history) {
+		return nil
+	}
+	pruned := make([]mysqlv1alpha1.SkippedTransaction, len(history)-keepFrom)
+	copy(pruned, history[keepFrom:])
+	return pruned
 }
 
 // appendSkipsCapped appends entries to history, oldest-first, and returns the

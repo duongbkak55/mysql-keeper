@@ -733,6 +733,16 @@ type AutoSkipConfig struct {
 	// +kubebuilder:default="1h"
 	// +optional
 	QuarantineWindow metav1.Duration `json:"quarantineWindow,omitempty"`
+
+	// HistoryRetention is how long an entry stays in
+	// status.replicationErrors.skippedTransactions before being pruned.
+	// Independent of the 50-entry cap: pruning happens before the cap is
+	// applied, so a long retention with few skips keeps every entry while a
+	// flood with short retention drops oldest entries faster than the cap
+	// alone would. Set to 0 to disable time-based pruning (cap-only).
+	// +kubebuilder:default="168h"
+	// +optional
+	HistoryRetention metav1.Duration `json:"historyRetention,omitempty"`
 }
 
 // ReplicationErrorStatus reports replication apply error state on the local
