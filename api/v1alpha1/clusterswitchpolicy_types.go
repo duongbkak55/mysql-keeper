@@ -307,6 +307,14 @@ type HealthCheckConfig struct {
 	// 0 (default) disables the event. Use this for an early warning before
 	// replication lag grows to the point where preflight C5/C6 would block
 	// a switchover.
+	//
+	// Deprecated: superseded by
+	// spec.replicationErrorHandling.gtidGapAlertThreshold, which adds a CR
+	// status condition and a Prometheus alarm gauge in addition to the
+	// event. When the new field is non-zero, the controller skips this
+	// legacy event-only path to avoid duplicate signals. The field is
+	// retained for back-compat and will be removed in a future major
+	// version.
 	// +kubebuilder:default=0
 	// +optional
 	GTIDLagAlertThresholdTransactions int64 `json:"gtidLagAlertThresholdTransactions,omitempty"`

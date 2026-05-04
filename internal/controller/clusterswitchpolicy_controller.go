@@ -82,6 +82,13 @@ type ClusterSwitchPolicyReconciler struct {
 	// which is acceptable: the tables already exist so the single DDL on
 	// restart is a cheap IF NOT EXISTS no-op.
 	schemaEnsured sync.Map
+
+	// activeReplicationErrorLabels tracks which (policyUID,role,channel,errno)
+	// label combinations are currently set to 1 on mysql_keeper_replication_error.
+	// Map key: "<policyUID>:<role>:<channel>:<errno>". Used so that a label set
+	// in cycle N but absent in cycle N+1 is explicitly reset to 0 — without
+	// this, stale "1" gauges would linger forever. Process-local (gauges are too).
+	activeReplicationErrorLabels sync.Map
 }
 
 // componentSet groups everything we build per-reconcile so the signature of
@@ -203,8 +210,19 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	// in "kubectl describe" and streams to any event watchers. The Prometheus
 	// metrics (GTIDMissingTransactions / ReplicationLagSeconds) are the primary
 	// alerting surface; the event is an early visual signal for on-call.
+	//
+	// The newer spec.replicationErrorHandling.gtidGapAlertThreshold supersedes
+	// healthCheck.GTIDLagAlertThresholdTransactions: when the new field is
+	// non-zero, observeReplicationErrors handles the alarm (event + condition +
+	// metric) and we skip this legacy emit to avoid duplicate events for the
+	// same incident. Operators can migrate at their own pace; until then this
+	// path remains active for back-compat.
+	newThreshold := int64(0)
+	if reh := policy.Spec.ReplicationErrorHandling; reh != nil {
+		newThreshold = reh.GTIDGapAlertThreshold
+	}
 	if threshold := policy.Spec.HealthCheck.GTIDLagAlertThresholdTransactions; gtidMeasured &&
-		r.Recorder != nil && threshold > 0 && gtidMissing > threshold {
+		r.Recorder != nil && threshold > 0 && newThreshold == 0 && gtidMissing > threshold {
 		r.Recorder.Event(policy, corev1.EventTypeWarning, "GTIDLagHigh",
 			fmt.Sprintf("GTID lag: %d unapplied transactions exceeds threshold %d — replication falling behind",
 				gtidMissing, threshold))

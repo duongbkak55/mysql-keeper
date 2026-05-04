@@ -1,13 +1,19 @@
 package controller
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
+	"github.com/duongnguyen/mysql-keeper/internal/metrics"
+	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
 
 // TestEffectiveReplicationErrorHandling_OmittedDefaults covers the upgrade
@@ -217,6 +223,104 @@ func TestUpdateReplicationErrorStatus_AnnotationClearPersisted(t *testing.T) {
 	if r.LastClearAnnotationValue != "2026-05-04T15:00:00Z" {
 		t.Errorf("expected LastClearAnnotationValue persisted, got %q",
 			r.LastClearAnnotationValue)
+	}
+}
+
+// fakeDetector is a workerErrorDetector test double that returns a fixed slice
+// of WorkerErrors. Use nil errors slice to simulate "no errors this cycle".
+type fakeDetector struct {
+	errs []pxc.WorkerError
+}
+
+func (f *fakeDetector) DetectWorkerErrors(_ context.Context, _ string) ([]pxc.WorkerError, error) {
+	return f.errs, nil
+}
+
+// fakeInspectorDetector satisfies both switchover.ReplicationInspector and
+// workerErrorDetector so it can be placed in componentSet.localInspector.
+// The ReplicationInspector methods are stubs — the stale-label reset test
+// does not exercise any of those code paths.
+type fakeInspectorDetector struct {
+	fakeDetector
+}
+
+func (f *fakeInspectorDetector) GetGTIDSnapshot(_ context.Context) (pxc.GTIDSnapshot, error) {
+	return pxc.GTIDSnapshot{}, nil
+}
+func (f *fakeInspectorDetector) GetExecutedGTID(_ context.Context) (string, error) { return "", nil }
+func (f *fakeInspectorDetector) IsGTIDSubset(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+func (f *fakeInspectorDetector) MissingGTIDs(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeInspectorDetector) WaitForGTID(_ context.Context, _ string, _ time.Duration) error {
+	return nil
+}
+func (f *fakeInspectorDetector) GetReplicationStatus(_ context.Context, _ string) (pxc.ReplicationStatus, error) {
+	return pxc.ReplicationStatus{}, nil
+}
+func (f *fakeInspectorDetector) ProbeReachable(_ context.Context, _ time.Duration) (bool, error) {
+	return true, nil
+}
+
+// TestObserveReplicationErrors_StaleLabelsReset verifies that when a
+// (role,channel,errno) combination was set to 1 in a prior reconcile cycle
+// but is absent in the current cycle, the reconciler explicitly resets its
+// gauge to 0 and removes the key from activeReplicationErrorLabels.
+//
+// Scenario:
+//   - Pre-populate activeReplicationErrorLabels with two stale keys (errno
+//     1062 and 1032) for a known policy UID.
+//   - Call observeReplicationErrors with a fake detector that returns no
+//     errors (empty cycle).
+//   - Assert both gauge series are reset to 0 and the map is empty for
+//     this policy's UID after the call.
+func TestObserveReplicationErrors_StaleLabelsReset(t *testing.T) {
+	const role = "dc"
+	const channel = "dc-to-dr"
+	uid := types.UID("aaaa-bbbb-cccc-dddd")
+
+	// Seed the gauges to 1 so we can detect the reset.
+	metrics.ReplicationError.WithLabelValues(role, channel, "1062").Set(1)
+	metrics.ReplicationError.WithLabelValues(role, channel, "1032").Set(1)
+
+	r := &ClusterSwitchPolicyReconciler{}
+	// Pre-populate two stale label keys as if a previous cycle had set them.
+	key1062 := replicationErrorLabelKey(string(uid), role, channel, "1062")
+	key1032 := replicationErrorLabelKey(string(uid), role, channel, "1032")
+	r.activeReplicationErrorLabels.Store(key1062, struct{}{})
+	r.activeReplicationErrorLabels.Store(key1032, struct{}{})
+
+	// Policy with matching UID, channel, role; no ReplicationErrorHandling so
+	// GTID gap alarm is disabled. The detector returns no errors this cycle.
+	policy := &mysqlv1alpha1.ClusterSwitchPolicy{
+		Spec: mysqlv1alpha1.ClusterSwitchPolicySpec{
+			ClusterRole:            role,
+			ReplicationChannelName: channel,
+		},
+	}
+	policy.UID = uid
+
+	det := &fakeInspectorDetector{fakeDetector: fakeDetector{errs: nil}}
+	comps := &componentSet{localInspector: det}
+
+	r.observeReplicationErrors(context.Background(), policy, comps, 0, false)
+
+	// Both stale gauges must be reset to 0.
+	if got := testutil.ToFloat64(metrics.ReplicationError.WithLabelValues(role, channel, "1062")); got != 0 {
+		t.Errorf("errno 1062 gauge: want 0, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.ReplicationError.WithLabelValues(role, channel, "1032")); got != 0 {
+		t.Errorf("errno 1032 gauge: want 0, got %v", got)
+	}
+
+	// Both keys must be removed from the tracking map.
+	if _, ok := r.activeReplicationErrorLabels.Load(key1062); ok {
+		t.Errorf("key1062 should have been deleted from activeReplicationErrorLabels")
+	}
+	if _, ok := r.activeReplicationErrorLabels.Load(key1032); ok {
+		t.Errorf("key1032 should have been deleted from activeReplicationErrorLabels")
 	}
 }
 

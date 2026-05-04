@@ -12,6 +12,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"strconv"
 	"time"
 
@@ -134,6 +135,12 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 		logger.V(1).Info("DetectWorkerErrors failed", "err", err)
 		return out
 	}
+	uid := string(policy.UID)
+	// currentLabels tracks every (uid,role,channel,errno) key observed THIS
+	// cycle so we can diff against activeReplicationErrorLabels and zero any
+	// gauge series that were "1" last cycle but are absent now.
+	currentLabels := map[string]struct{}{}
+
 	now := time.Now()
 	for _, w := range workerErrs {
 		ts := w.Timestamp
@@ -149,8 +156,11 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 			ObservedAt: metav1.NewTime(ts),
 		}
 		out.AllErrors = append(out.AllErrors, entry)
-		metrics.ReplicationError.WithLabelValues(role, channel,
-			strconv.FormatInt(int64(w.Errno), 10)).Set(1)
+		errnoStr := strconv.FormatInt(int64(w.Errno), 10)
+		metrics.ReplicationError.WithLabelValues(role, channel, errnoStr).Set(1)
+		key := replicationErrorLabelKey(uid, role, channel, errnoStr)
+		currentLabels[key] = struct{}{}
+		r.activeReplicationErrorLabels.Store(key, struct{}{})
 	}
 	if len(out.AllErrors) > 0 {
 		first := out.AllErrors[0]
@@ -160,15 +170,30 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 				fmt.Sprintf("channel=%q worker=%d errno=%d gtid=%q: %s",
 					first.Channel, first.WorkerID, first.Errno, first.GTID, first.Message))
 		}
-	} else {
-		// Best-effort metric reset for the most recent errno seen on the CR.
-		// We do not enumerate historical errnos — operators should alert on
-		// `replication_error == 1` rather than its absence.
-		if last := policy.Status.ReplicationErrors; last != nil && last.LastError != nil {
-			metrics.ReplicationError.WithLabelValues(role, channel,
-				strconv.FormatInt(int64(last.LastError.Errno), 10)).Set(0)
-		}
 	}
+
+	// Diff-based metric reset: any key for this policy that was active in a
+	// prior cycle but is absent from currentLabels must be zeroed. This
+	// prevents stale "errno=X → 1" series from lingering after the error
+	// rotates to a different errno or clears entirely.
+	uidPrefix := uid + ":"
+	r.activeReplicationErrorLabels.Range(func(k, _ any) bool {
+		key := k.(string)
+		if !strings.HasPrefix(key, uidPrefix) {
+			return true // belongs to a different policy; skip
+		}
+		if _, present := currentLabels[key]; present {
+			return true // still active this cycle; leave at 1
+		}
+		// Parse role/channel/errno back out of the key so we can call
+		// WithLabelValues with exactly the values that were registered.
+		_, parsedRole, parsedChannel, parsedErrno, ok := parseReplicationErrorLabelKey(key)
+		if ok {
+			metrics.ReplicationError.WithLabelValues(parsedRole, parsedChannel, parsedErrno).Set(0)
+		}
+		r.activeReplicationErrorLabels.Delete(key)
+		return true
+	})
 
 	// Capture quarantine state before applyAutoSkip so we can detect the
 	// operator-driven clear transition for event emission below.
@@ -325,5 +350,37 @@ func appendSkipsCapped(history []mysqlv1alpha1.SkippedTransaction,
 		return combined
 	}
 	return combined[len(combined)-capN:]
+}
+
+// replicationErrorLabelKey encodes the four label dimensions into a single
+// string key used by activeReplicationErrorLabels. Format:
+//
+//	"<policyUID>:<role>:<channel>:<errno>"
+//
+// None of the fields contain ":" in practice (UIDs use "-", role is "dc"/"dr",
+// channel names do not use ":", errno is a decimal integer), so simple
+// splitting is safe.
+func replicationErrorLabelKey(uid, role, channel, errnoStr string) string {
+	return uid + ":" + role + ":" + channel + ":" + errnoStr
+}
+
+// parseReplicationErrorLabelKey is the inverse of replicationErrorLabelKey.
+// It returns (uid, role, channel, errnoStr, ok). ok is false only when the
+// key does not have the expected number of colon-delimited segments.
+//
+// UIDs are UUID-format and contain hyphens but no colons, so splitting on ":"
+// with a fixed field count is safe. We split into exactly 4 parts by limiting
+// the split to n=4 so that channel names containing ":" (non-standard but
+// theoretically possible) are still handled correctly — they would land in the
+// channel segment. In practice MySQL channel names are alphanumeric+hyphen.
+func parseReplicationErrorLabelKey(key string) (uid, role, channel, errnoStr string, ok bool) {
+	// UID is a UUID (8-4-4-4-12 hex with hyphens) — contains no colons.
+	// Format: uid:role:channel:errno  → 4 colon-separated fields minimum.
+	// We split on ":" at most 4 times to preserve any colons inside channel.
+	parts := strings.SplitN(key, ":", 4)
+	if len(parts) != 4 {
+		return "", "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
 }
 
