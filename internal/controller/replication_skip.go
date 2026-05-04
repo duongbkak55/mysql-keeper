@@ -84,6 +84,7 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 	now time.Time,
 ) {
 	role := policy.Spec.ClusterRole
+	logger := log.FromContext(ctx).WithValues("component", "replication-skip")
 
 	defer evaluateQuarantine(r.Recorder, policy, cfg, out, now)
 
@@ -93,6 +94,12 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 			for range out.AllErrors {
 				metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "disabled").Inc()
 			}
+			logger.Info("replication_skip_blocked",
+				"event", "replication_skip_blocked",
+				"cluster_role", role,
+				"reason", "disabled",
+				"count", len(out.AllErrors),
+			)
 		}
 		return
 	}
@@ -104,6 +111,12 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		for range out.AllErrors {
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "unsupported_inspector").Inc()
 		}
+		logger.Info("replication_skip_blocked",
+			"event", "replication_skip_blocked",
+			"cluster_role", role,
+			"reason", "unsupported_inspector",
+			"count", len(out.AllErrors),
+		)
 		return
 	}
 
@@ -115,6 +128,12 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		for range out.AllErrors {
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "quarantined").Inc()
 		}
+		logger.Info("replication_skip_blocked",
+			"event", "replication_skip_blocked",
+			"cluster_role", role,
+			"reason", "quarantined",
+			"count", len(out.AllErrors),
+		)
 		return
 	}
 
@@ -129,11 +148,26 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		if _, ok := whitelist[errno]; !ok {
 			out.SkipBlocked["not_whitelisted"]++
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "not_whitelisted").Inc()
+			logger.Info("replication_skip_blocked",
+				"event", "replication_skip_blocked",
+				"cluster_role", role,
+				"channel", channel,
+				"errno", errno,
+				"gtid", gtid,
+				"reason", "not_whitelisted",
+			)
 			continue
 		}
 		if gtid == "" {
 			out.SkipBlocked["missing_gtid"]++
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "missing_gtid").Inc()
+			logger.Info("replication_skip_blocked",
+				"event", "replication_skip_blocked",
+				"cluster_role", role,
+				"channel", channel,
+				"errno", errno,
+				"reason", "missing_gtid",
+			)
 			if r.Recorder != nil {
 				r.Recorder.Event(policy, corev1.EventTypeWarning, "ReplicationSkipNoGTID",
 					fmt.Sprintf("cannot skip errno=%d on channel %q: failed GTID not exposed by performance_schema",
@@ -148,6 +182,16 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 			int(cfg.AutoSkip.MaxSkipsPerWindow) {
 			out.SkipBlocked["rate_limited"]++
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "rate_limited").Inc()
+			logger.Info("replication_skip_blocked",
+				"event", "replication_skip_blocked",
+				"cluster_role", role,
+				"channel", channel,
+				"errno", errno,
+				"gtid", gtid,
+				"reason", "rate_limited",
+				"max_per_window", cfg.AutoSkip.MaxSkipsPerWindow,
+				"window", cfg.AutoSkip.Window.Duration.String(),
+			)
 			if r.Recorder != nil {
 				r.Recorder.Event(policy, corev1.EventTypeWarning, "SkipRateLimited",
 					fmt.Sprintf("skip rate limit %d/%s reached for channel %q",
@@ -170,6 +214,14 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 			metrics.ReplicationSkipBlockedTotal.WithLabelValues(role, "dry_run").Inc()
 			metrics.ReplicationSkippedTotal.WithLabelValues(role,
 				strconv.FormatInt(int64(errno), 10)).Inc()
+			logger.Info("replication_would_skip",
+				"event", "replication_would_skip",
+				"cluster_role", role,
+				"channel", channel,
+				"errno", errno,
+				"gtid", gtid,
+				"dry_run", true,
+			)
 			if r.Recorder != nil {
 				r.Recorder.Event(policy, corev1.EventTypeNormal, "WouldSkipTransaction",
 					fmt.Sprintf("dry-run: would skip gtid=%q errno=%d on channel %q",
@@ -180,8 +232,13 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		}
 
 		if err := skipper.SkipNextTransaction(ctx, channel, gtid); err != nil {
-			log.FromContext(ctx).Error(err, "SkipNextTransaction failed",
-				"channel", channel, "gtid", gtid, "errno", errno)
+			logger.Error(err, "replication_skip_failed",
+				"event", "replication_skip_failed",
+				"cluster_role", role,
+				"channel", channel,
+				"errno", errno,
+				"gtid", gtid,
+			)
 			if r.Recorder != nil {
 				r.Recorder.Event(policy, corev1.EventTypeWarning, "ReplicationSkipFailed",
 					fmt.Sprintf("failed to skip gtid=%q errno=%d on channel %q: %v",
@@ -191,6 +248,14 @@ func (r *ClusterSwitchPolicyReconciler) applyAutoSkipWith(
 		}
 		metrics.ReplicationSkippedTotal.WithLabelValues(role,
 			strconv.FormatInt(int64(errno), 10)).Inc()
+		logger.Info("replication_transaction_skipped",
+			"event", "replication_transaction_skipped",
+			"cluster_role", role,
+			"channel", channel,
+			"errno", errno,
+			"gtid", gtid,
+			"message", truncateMessage(errEntry.Message, 256),
+		)
 		if r.Recorder != nil {
 			// MySQL error messages on 1062/1032 may include row-level data.
 			// Truncate to keep the event payload bounded and avoid leaking

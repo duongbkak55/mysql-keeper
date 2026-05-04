@@ -130,6 +130,27 @@ If any of these conditions is not met the annotation is preserved; the
 controller will retry the release on subsequent reconciles. The
 `ReplicaQuarantineCleared` event is emitted on success.
 
+## Structured logs (ELK / Loki)
+
+Every state transition is logged as a single structured line via the
+controller-runtime logger so external log pipelines (Fluent Bit → ELK,
+Promtail → Loki, etc.) can ingest and alert without parsing K8s events.
+The `event` key uniquely identifies the transition.
+
+| `event=` value | Emitted when | Key fields |
+|---|---|---|
+| `replication_sql_error` | Per-worker SQL apply error observed | `cluster_role`, `channel`, `worker_id`, `errno`, `gtid`, `message` |
+| `replication_gtid_gap_high` | Missing transactions exceed `gtidGapAlertThreshold` | `cluster_role`, `channel`, `missing`, `threshold` |
+| `replication_transaction_skipped` | Auto-skip succeeded | `cluster_role`, `channel`, `errno`, `gtid`, `message` |
+| `replication_would_skip` | Dry-run would-skip | same as above + `dry_run=true` |
+| `replication_skip_blocked` | Skip suppressed | `cluster_role`, `channel`, `errno`, `gtid`, `reason` ∈ `{disabled, unsupported_inspector, quarantined, not_whitelisted, missing_gtid, rate_limited}` |
+| `replication_skip_failed` | SkipNextTransaction returned error | `cluster_role`, `channel`, `errno`, `gtid` (level=ERROR) |
+| `replica_quarantine_entered` | Skip count first crossed `maxSkipBeforeQuarantine` | `cluster_role`, `channel`, `reason` |
+| `replica_quarantine_cleared` | Operator annotation released quarantine | `cluster_role`, `channel`, `annotation_value` |
+| `replica_quarantine_clear_refused` | Annotation observed but preconditions failed | `cluster_role`, `channel`, `annotation_value`, `reason` |
+
+Example PromQL/LogQL alert: `count_over_time({event="replica_quarantine_entered"}[1h]) > 0`.
+
 ## Race safety
 
 The controller uses controller-runtime leader election to ensure only one

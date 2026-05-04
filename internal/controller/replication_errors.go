@@ -116,6 +116,13 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	// be tuned independently during migration.
 	if gtidMeasured && cfg.GTIDGapAlertThreshold > 0 && gtidMissing > cfg.GTIDGapAlertThreshold {
 		out.GTIDGapTriggered = true
+		logger.Info("replication_gtid_gap_high",
+			"event", "replication_gtid_gap_high",
+			"cluster_role", role,
+			"channel", channel,
+			"missing", gtidMissing,
+			"threshold", cfg.GTIDGapAlertThreshold,
+		)
 		if r.Recorder != nil {
 			r.Recorder.Event(policy, corev1.EventTypeWarning, "GTIDGapHigh",
 				fmt.Sprintf("GTID gap %d exceeds replicationErrorHandling threshold %d on channel %q",
@@ -161,6 +168,15 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 		key := replicationErrorLabelKey(uid, role, channel, errnoStr)
 		currentLabels[key] = struct{}{}
 		r.activeReplicationErrorLabels.Store(key, struct{}{})
+		logger.Info("replication_sql_error",
+			"event", "replication_sql_error",
+			"cluster_role", role,
+			"channel", w.Channel,
+			"worker_id", w.WorkerID,
+			"errno", w.Errno,
+			"gtid", w.FailedGTID,
+			"message", truncateMessage(w.Message, 256),
+		)
 	}
 	if len(out.AllErrors) > 0 {
 		first := out.AllErrors[0]
@@ -203,13 +219,38 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	// or when the inspector cannot satisfy the skipper interface.
 	r.applyAutoSkip(ctx, policy, comps, cfg, &out)
 
-	// Operator-driven clear-quarantine: emit a Normal event so the
-	// transition is visible in `kubectl describe` without parsing logs.
-	if wasQuarantined && !out.QuarantineActive && r.Recorder != nil {
+	// Quarantine transition logs — one line per state change so ELK can
+	// alert on the transition rather than parsing condition history.
+	switch {
+	case !wasQuarantined && out.QuarantineActive:
+		logger.Info("replica_quarantine_entered",
+			"event", "replica_quarantine_entered",
+			"cluster_role", role,
+			"channel", channel,
+			"reason", out.QuarantineReason,
+		)
+	case wasQuarantined && !out.QuarantineActive:
 		val := policy.Annotations[mysqlv1alpha1.AnnotationClearQuarantine]
-		r.Recorder.Event(policy, corev1.EventTypeNormal, "ReplicaQuarantineCleared",
-			fmt.Sprintf("operator cleared replica quarantine via annotation %s=%q",
-				mysqlv1alpha1.AnnotationClearQuarantine, val))
+		logger.Info("replica_quarantine_cleared",
+			"event", "replica_quarantine_cleared",
+			"cluster_role", role,
+			"channel", channel,
+			"annotation_value", val,
+		)
+		if r.Recorder != nil {
+			r.Recorder.Event(policy, corev1.EventTypeNormal, "ReplicaQuarantineCleared",
+				fmt.Sprintf("operator cleared replica quarantine via annotation %s=%q",
+					mysqlv1alpha1.AnnotationClearQuarantine, val))
+		}
+	}
+	if out.RefusedClearAnnotation != "" {
+		logger.Info("replica_quarantine_clear_refused",
+			"event", "replica_quarantine_clear_refused",
+			"cluster_role", role,
+			"channel", channel,
+			"annotation_value", out.RefusedClearAnnotation,
+			"reason", out.RefusedClearReason,
+		)
 	}
 
 	return out
