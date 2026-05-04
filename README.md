@@ -399,7 +399,8 @@ kubectl annotate clusterswitchpolicy <name> \
 
 See [`docs/replication-error-handling.md`](docs/replication-error-handling.md)
 for the full design (alarm sources, skip mechanism, failure modes,
-upgrade safety).
+upgrade safety), or [`docs/README.md`](docs/README.md) for the complete
+documentation index including runbooks and preflight check reference.
 
 ---
 
@@ -512,6 +513,10 @@ spec:
 After failover, MANO flips `isSource` on both CNFs, and the PXC Operator reconciles the above accordingly.
 
 ---
+
+## Documentation index
+
+Full documentation, runbooks, and the preflight check reference are in [`docs/README.md`](docs/README.md).
 
 ## Troubleshooting
 

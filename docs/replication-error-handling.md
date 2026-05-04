@@ -11,7 +11,8 @@ divergence.
 | Surface | Where it shows up |
 |---|---|
 | `kubectl describe csp <name>` | Conditions `ReplicationHealthy`, `ReplicaQuarantined` + status field `replicationErrors` (last error, skip history, quarantine state) |
-| K8s events | `ReplicationSQLError`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ReplicaQuarantined`, `ReplicaQuarantineCleared`, `ClearQuarantineRefused`, `GTIDGapHigh`, `ManualSwitchoverRefused` |
+| K8s events (replication) | `ReplicationSQLError`, `GTIDGapHigh`, `ReplicaQuarantined`, `ReplicaQuarantineCleared`, `ClearQuarantineRefused`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ManualSwitchoverRefused` |
+| K8s events (controller) | `GTIDLagHigh` (legacy, suppressed when `gtidGapAlertThreshold>0`), `DegradedRecovery`, `DegradedRecoveryFailed` |
 | Prometheus | `mysql_keeper_replication_error{cluster_role,channel,errno}`, `mysql_keeper_replication_skipped_total{cluster_role,errno}`, `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}`, `mysql_keeper_replication_skip_failed_total{cluster_role,errno}`, `mysql_keeper_replica_quarantined{cluster_role}`, `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` — all well-known label combinations are pre-seeded in `init()` so series always appear as `0` rather than absent before the first event |
 | PreFlight | New hard check **C12_ReplicaNotQuarantined** blocks promote while quarantined |
 
@@ -159,6 +160,12 @@ Reconcile loop is active per cluster. Cross-cluster races are not possible
 because at most one cluster acts as the replica during normal operation.
 The auto-skip path is therefore not protected by an additional lease — if
 you observe duplicate skips, file a bug.
+
+## See also
+
+- [Incident response playbook](runbooks/incident-response-playbook.md) — triage steps when a quarantine or skip alert fires in production
+- [GTID lag monitoring](runbooks/gtid-lag-monitoring.md) — how to interpret GTID gap vs lag signals
+- [Documentation index](README.md) — full navigation hub
 
 ## Failure modes
 

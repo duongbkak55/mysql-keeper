@@ -600,3 +600,4 @@ watch -n 5 'kubectl describe clusterswitchpolicy dc-dr-policy | grep -A 4 "Gtid 
 | GTID lag monitoring flow and alerts | `gtid-lag-monitoring.md` |
 | Remote-unreachable threshold design | `remote-unreachable-failover.md` |
 | Pre-go-live checklist | `go-live-drill-plan.md` |
+| Replication SQL errors, auto-skip, quarantine guard | `../replication-error-handling.md` |

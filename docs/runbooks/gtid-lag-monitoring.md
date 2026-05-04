@@ -1,5 +1,11 @@
 # GTID Lag Monitoring
 
+> **Terminology:** *GTID lag* = time-based delay (seconds behind source, measured by `mysql_keeper_replication_lag_seconds`).
+> *GTID gap* = transaction count (unapplied GTIDs, measured by `mysql_keeper_gtid_missing_transactions`).
+> These are distinct signals — lag can be high with a small gap (large transactions), or gap can be high with low lag (fast replication catching up).
+>
+> `spec.healthCheck.gtidLagAlertThresholdTransactions` is **deprecated** — use `spec.replicationErrorHandling.gtidGapAlertThreshold` for new deployments (adds CR condition + Prometheus gauge in addition to the K8s event).
+
 Describes how mysql-keeper continuously measures replication lag between the
 source (DC) and replica (DR) clusters, how it differs from the switchover
 preflight checks, and why both are needed.

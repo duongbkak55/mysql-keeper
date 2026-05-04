@@ -210,3 +210,8 @@ stateDiagram-v2
 3. **Manual switchover**: patch `spec.manualSwitchoverTarget=promote-remote` → graceful (drain trước fence). Controller xóa field này khi xong.
 4. **Resume**: checkpoint `SwitchoverProgress` cho phép tiếp tục sau pod restart; quá `resumeStuckTimeout` → `Degraded`.
 5. **Recovery khỏi Degraded**: annotation `mysql.keeper.io/recover-degraded` (one-shot) hoặc `recovery.autoRecoveryInterval` (chu kỳ).
+
+## 9. Xem thêm
+
+- [Replication error handling](replication-error-handling.md) — phát hiện lỗi SQL applier, auto-skip, quarantine guard, alarm và metrics
+- [Documentation index](README.md) — điều hướng toàn bộ tài liệu
