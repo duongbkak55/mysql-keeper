@@ -11,8 +11,8 @@ divergence.
 | Surface | Where it shows up |
 |---|---|
 | `kubectl describe csp <name>` | Conditions `ReplicationHealthy`, `ReplicaQuarantined` + status field `replicationErrors` (last error, skip history, quarantine state) |
-| K8s events | `ReplicationSQLError`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ReplicaQuarantined`, `ReplicaQuarantineCleared`, `ClearQuarantineRefused`, `GTIDGapHigh` |
-| Prometheus | `mysql_keeper_replication_error{cluster_role,channel,errno}`, `mysql_keeper_replication_skipped_total{cluster_role,errno}`, `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}`, `mysql_keeper_replication_skip_failed_total{cluster_role,errno}`, `mysql_keeper_replica_quarantined{cluster_role}`, `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` |
+| K8s events | `ReplicationSQLError`, `ReplicationTransactionSkipped`, `WouldSkipTransaction`, `SkipRateLimited`, `ReplicationSkipFailed`, `ReplicationSkipNoGTID`, `ReplicaQuarantined`, `ReplicaQuarantineCleared`, `ClearQuarantineRefused`, `GTIDGapHigh`, `ManualSwitchoverRefused` |
+| Prometheus | `mysql_keeper_replication_error{cluster_role,channel,errno}`, `mysql_keeper_replication_skipped_total{cluster_role,errno}`, `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}`, `mysql_keeper_replication_skip_failed_total{cluster_role,errno}`, `mysql_keeper_replica_quarantined{cluster_role}`, `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` — all well-known label combinations are pre-seeded in `init()` so series always appear as `0` rather than absent before the first event |
 | PreFlight | New hard check **C12_ReplicaNotQuarantined** blocks promote while quarantined |
 
 ## How detection works
@@ -89,6 +89,7 @@ prevents silent data divergence on upgrade.
 | `autoSkip.window` | **10m** | Rolling rate-limit window |
 | `autoSkip.maxSkipBeforeQuarantine` | **5** | Hard quarantine threshold (must be ≥ `maxSkipsPerWindow`) |
 | `autoSkip.quarantineWindow` | **1h** | Rolling window for the quarantine threshold |
+| `autoSkip.historyRetention` | **7d** | TTL for entries in `status.replicationErrors.skippedTransactions`. Entries older than this are pruned each reconcile. Set to `0` to keep cap-only pruning (50 entries). Default aligns with typical binlog retention so the audit trail covers what MySQL can replay |
 
 ## Quarantine — why and how to clear it
 
@@ -143,7 +144,7 @@ The `event` key uniquely identifies the transition.
 | `replication_gtid_gap_high` | Missing transactions exceed `gtidGapAlertThreshold` | `cluster_role`, `channel`, `missing`, `threshold` |
 | `replication_transaction_skipped` | Auto-skip succeeded | `cluster_role`, `channel`, `errno`, `gtid`, `message` |
 | `replication_would_skip` | Dry-run would-skip | same as above + `dry_run=true` |
-| `replication_skip_blocked` | Skip suppressed | `cluster_role`, `channel`, `errno`, `gtid`, `reason` ∈ `{disabled, unsupported_inspector, quarantined, not_whitelisted, missing_gtid, rate_limited}` |
+| `replication_skip_blocked` | Skip suppressed | `cluster_role`, `channel`, `errno`, `gtid`, `reason` ∈ `{disabled, unsupported_inspector, quarantined, not_whitelisted, missing_gtid, rate_limited, dry_run}` — dry-run path increments this counter with `reason=dry_run` in addition to emitting `replication_would_skip` |
 | `replication_skip_failed` | SkipNextTransaction returned error | `cluster_role`, `channel`, `errno`, `gtid` (level=ERROR) |
 | `replica_quarantine_entered` | Skip count first crossed `maxSkipBeforeQuarantine` | `cluster_role`, `channel`, `reason` |
 | `replica_quarantine_cleared` | Operator annotation released quarantine | `cluster_role`, `channel`, `annotation_value` |
@@ -167,12 +168,21 @@ you observe duplicate skips, file a bug.
 | `ReplicationSkipFailed` event | SQL skip failed mid-flight; controller restored automatic GTID + restarted thread | Investigate the underlying error — repeated failures are not retried automatically |
 | `SkipRateLimited` event | Burst of skip-eligible errors exceeded `maxSkipsPerWindow` | Investigate the source data; raise the limit only after triage |
 | `ReplicaQuarantined=True` condition | Skip count exceeded `maxSkipBeforeQuarantine` | Reconcile data divergence then clear with the annotation above |
+| `ClearQuarantineRefused` with `active_error` reason | Active SQL applier error still present **at the start of this reconcile cycle** | If the controller just auto-skipped that error in the same cycle, the error may already be gone from MySQL — retry on the next reconcile before re-issuing the annotation |
 
 ## Related fields
 
-- `spec.healthCheck.gtidLagAlertThresholdTransactions` — pre-existing GTID
-  lag alarm. The new `replicationErrorHandling.gtidGapAlertThreshold` is
-  intentionally a separate knob so you can tune them independently during
-  migration. Consolidation is on the follow-up list.
-- `spec.preFlight.catchupTimeout` — already gated by C5/C6, unrelated to
-  C12 but applies in the same preflight pass.
+- `spec.healthCheck.gtidLagAlertThresholdTransactions` — **legacy** GTID lag
+  alarm. Emits only a `GTIDLagHigh` K8s event; no Prometheus gauge, no CR
+  condition. **When `replicationErrorHandling.gtidGapAlertThreshold` is
+  non-zero, the controller suppresses the legacy `GTIDLagHigh` event to avoid
+  duplicate signals.** The field is retained for backwards-compatibility and
+  will be removed in a future major version.
+- `spec.replicationErrorHandling.gtidGapAlertThreshold` — **new** GTID gap
+  alarm. Emits `GTIDGapHigh` Warning event + structured log
+  (`replication_gtid_gap_high`) + sets `ReplicationHealthy=False/GTIDGapExceeded`
+  condition + Prometheus gauge. Prefer this over the legacy field for new
+  deployments.
+- `spec.preFlight.catchupTimeout` — gated by C5/C6 in the same preflight pass
+  as C12; unrelated to replication error handling but applies in the same
+  `Engine.Execute()` call.

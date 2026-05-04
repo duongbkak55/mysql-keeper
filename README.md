@@ -354,12 +354,12 @@ curl http://<pod-ip>:8080/metrics | grep mysql_keeper
 ```
 
 Key metrics:
-- `mysql_keeper_cluster_healthy{cluster="local|remote"}` — health gauge
+- `mysql_keeper_cluster_healthy{cluster_role,scope}` — 1 if the cluster is healthy; `scope` ∈ `local` / `remote`
 - `mysql_keeper_switchover_total{result="success|failed|rolledback"}` — switchover counter
-- `mysql_keeper_consecutive_failures{cluster="local|remote"}` — failure streak gauge
+- `mysql_keeper_consecutive_failures{cluster_role,scope}` — consecutive health-check failure streak; `scope` ∈ `local` / `local_unreachable` / `remote` / `remote_unreachable`
 - `mysql_keeper_replication_error{cluster_role,channel,errno}` — 1 while a SQL applier error is firing
 - `mysql_keeper_replication_skipped_total{cluster_role,errno}` — auto-skipped transactions counter
-- `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}` — would-be skips that were blocked (`not_whitelisted` / `rate_limited` / `dry_run` / `quarantined`)
+- `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}` — would-be skips blocked before SQL execution; `reason` ∈ `disabled` / `not_whitelisted` / `rate_limited` / `dry_run` / `quarantined` / `missing_gtid` / `unsupported_inspector`
 - `mysql_keeper_replica_quarantined{cluster_role}` — 1 when PreFlight C12 is blocking promote
 - `mysql_keeper_replication_skip_failed_total{cluster_role,errno}` — SkipNextTransaction SQL flow returned an error
 - `mysql_keeper_quarantine_clear_refused_total{cluster_role,reason}` — clear-quarantine annotation refused (`active_error` / `burst_in_window`)
@@ -385,6 +385,7 @@ spec:
       window: 10m
       maxSkipBeforeQuarantine: 5
       quarantineWindow: 1h
+      historyRetention: 7d      # TTL for skip-history audit entries
 ```
 
 Clear quarantine after operator review:
@@ -392,6 +393,8 @@ Clear quarantine after operator review:
 ```bash
 kubectl annotate clusterswitchpolicy <name> \
   mysql.keeper.io/clear-quarantine="$(date -u +%FT%TZ)" --overwrite
+
+> **Note:** if you set `spec.manualSwitchoverTarget` while quarantined, the controller will refuse the switchover with a `ManualSwitchoverRefused` Warning event and preserve the trigger — you don't need to re-set it after clearing quarantine.
 ```
 
 See [`docs/replication-error-handling.md`](docs/replication-error-handling.md)
