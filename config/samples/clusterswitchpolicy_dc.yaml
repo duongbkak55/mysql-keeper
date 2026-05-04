@@ -137,3 +137,27 @@ spec:
 
   # Enable automatic failover. Set to false for manual-only operation.
   autoFailover: true
+
+  # Replication error handling — alarm on SQL apply errors / GTID gaps,
+  # optionally auto-skip rows that match a conservative whitelist.
+  # See docs/replication-error-handling.md for the full design.
+  replicationErrorHandling:
+    # 0 disables the GTID-gap alarm. Positive values fire a Warning event +
+    # condition once gtid_missing_transactions exceeds the threshold.
+    gtidGapAlertThreshold: 0
+    autoSkip:
+      enabled: true
+      # Dry-run logs "WouldSkipTransaction" without running SQL. Flip to true
+      # on a freshly-deployed cluster while you validate the configuration.
+      dryRun: false
+      # 1062 = duplicate key, 1032 = row not found on update/delete.
+      # Schema-drift errors (1146 table missing, 1054 column missing) are
+      # intentionally absent — they require operator review, not silent skip.
+      errorCodeWhitelist: [1062, 1032]
+      maxSkipsPerWindow: 3
+      window: 10m
+      # When skip count in QuarantineWindow strictly exceeds this threshold,
+      # the replica is quarantined and PreFlight C12 blocks any promote
+      # until the operator clears it via annotation.
+      maxSkipBeforeQuarantine: 5
+      quarantineWindow: 1h

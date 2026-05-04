@@ -102,3 +102,17 @@ spec:
     pollTimeout: 5m
 
   autoFailover: true
+
+  # Replication error handling — alarm on SQL apply errors / GTID gaps,
+  # optionally auto-skip rows that match a conservative whitelist.
+  # See docs/replication-error-handling.md for the full design.
+  replicationErrorHandling:
+    gtidGapAlertThreshold: 0
+    autoSkip:
+      enabled: true
+      dryRun: false
+      errorCodeWhitelist: [1062, 1032]
+      maxSkipsPerWindow: 3
+      window: 10m
+      maxSkipBeforeQuarantine: 5
+      quarantineWindow: 1h

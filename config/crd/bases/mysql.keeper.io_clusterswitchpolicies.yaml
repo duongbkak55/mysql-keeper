@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.16.5
   name: clusterswitchpolicies.mysql.keeper.io
 spec:
   group: mysql.keeper.io
@@ -89,6 +89,17 @@ spec:
                       a cluster is declared unhealthy and failover is considered.
                     format: int32
                     type: integer
+                  gtidLagAlertThresholdTransactions:
+                    default: 0
+                    description: |-
+                      GTIDLagAlertThresholdTransactions, when positive, causes the controller
+                      to emit a Warning Kubernetes event on the CR whenever the number of
+                      unapplied GTID transactions on the replica exceeds this value.
+                      0 (default) disables the event. Use this for an early warning before
+                      replication lag grows to the point where preflight C5/C6 would block
+                      a switchover.
+                    format: int64
+                    type: integer
                   interval:
                     default: 15s
                     description: Interval between consecutive health check cycles.
@@ -109,10 +120,20 @@ spec:
                     default: 0
                     description: |-
                       RemoteUnreachableThreshold, when positive, enables an additional
-                      auto-failover gate: if the remote MySQL has been TCP-unreachable for
-                      this many consecutive health checks AND AllowDataLossFailover=true,
-                      the controller will promote the remote cluster even though it cannot
-                      run the GTID subset preflight. Zero (default) disables this path.
+                      auto-promotion path: if the remote cluster has been TCP-unreachable for
+                      this many consecutive health-check cycles the controller promotes the
+                      local cluster to active.
+
+                      This path is INDEPENDENT of FailureThreshold (which triggers on LOCAL
+                      failure). Use it to let the passive DR site take over when the active DC
+                      disappears entirely — e.g. DC k8s + MySQL both down.
+
+                      IMPORTANT: AllowDataLossFailover must also be true. Because the remote
+                      cannot be queried, GTID subset verification (preflight C5/C6) is
+                      impossible. Set this threshold only after accepting that risk.
+
+                      Example: interval=15s, threshold=10 → promote after ~2.5 min of silence.
+                      0 (default) disables this path entirely.
                     format: int32
                     type: integer
                 required:
@@ -200,14 +221,6 @@ spec:
                     description: PollTimeout is the maximum time to wait for a MANO
                       LCM operation to complete.
                     type: string
-                  tlsInsecureSkipVerify:
-                    description: |-
-                      TLSInsecureSkipVerify disables TLS certificate verification when
-                      connecting to the MANO API. Set to true when the MANO server is
-                      addressed by IP only and its certificate has no IP SANs.
-                      Do NOT use in production environments where the MANO endpoint is
-                      reachable from untrusted networks.
-                    type: boolean
                   remoteCnfName:
                     description: RemoteCNFName is the CNF name of the remote PerconaXtraDBCluster
                       in MANO.
@@ -216,6 +229,14 @@ spec:
                     description: RemoteVDUName is the VDU name of the remote PerconaXtraDBCluster
                       in MANO.
                     type: string
+                  tlsInsecureSkipVerify:
+                    description: |-
+                      TLSInsecureSkipVerify disables TLS certificate verification when
+                      connecting to the MANO API. Set to true when the MANO server is
+                      addressed by IP only and its certificate has no IP SANs.
+                      Do NOT use in production environments where the MANO endpoint is
+                      reachable from untrusted networks.
+                    type: boolean
                   tokenSecretRef:
                     description: |-
                       TokenSecretRef refers to a Secret with a "token" key containing a static Bearer token.
@@ -253,9 +274,7 @@ spec:
                   Set this when DC→DR and DR→DC use different channel names
                   (e.g. "dc-to-dr" inbound on DR vs "dr-to-dc" inbound on DC).
 
-
                   Empty means "same as ReplicationChannelName" — the symmetric case.
-
 
                   Which channel the controller uses at each step:
                     - PreFlight C3 (is remote replica healthy?) → PeerReplicationChannelName
@@ -285,19 +304,19 @@ spec:
                     type: integer
                 type: object
               proxySQL:
-                description: ProxySQL lists the local ProxySQL admin endpoints (typically
-                  3 instances).
+                description: |-
+                  ProxySQL lists the local ProxySQL admin endpoints (static list).
+                  Use for StatefulSet-based ProxySQL with stable pod DNS names.
+                  Mutually exclusive with ProxySQLSelector; if both are set ProxySQLSelector takes precedence.
                 items:
                   description: |-
                     ProxySQLEndpoint defines a single ProxySQL admin interface.
-
 
                     The controller talks to ProxySQL on its admin port (default 6032) to:
                       - health-check the instance (SELECT 1)
                       - rewrite hostgroup routing during a switchover (UPDATE mysql_servers
                       - apply the blackhole fence when the SQL fence cannot complete
                         (OFFLINE_HARD + max_connections=0 on the target writer)
-
 
                     The admin port is separate from the client port that applications use
                     (default 6033) — do not confuse the two in Service definitions.
@@ -335,7 +354,7 @@ spec:
                   ProxySQLSelector discovers ProxySQL admin endpoints dynamically at each
                   reconcile by listing Pods matching the given label selector. Use this when
                   ProxySQL is deployed as a Deployment (pod IPs change on heal/restart).
-                  Mutually exclusive with proxySQL.
+                  Mutually exclusive with ProxySQL.
                 properties:
                   adminPort:
                     default: 6032
@@ -362,7 +381,6 @@ spec:
                       type: string
                     description: MatchLabels is a map of key=value pairs that ProxySQL
                       pods must carry.
-                    minProperties: 1
                     type: object
                   namespace:
                     description: Namespace where the ProxySQL pods run.
@@ -380,6 +398,20 @@ spec:
                 description: PXCNamespace is the namespace where the local PerconaXtraDBCluster
                   resource lives.
                 type: string
+              recovery:
+                description: Recovery configures how the controller attempts to exit
+                  the Degraded phase.
+                properties:
+                  autoRecoveryInterval:
+                    description: |-
+                      AutoRecoveryInterval, when positive, causes the controller to
+                      periodically re-evaluate cluster health while in Degraded phase.
+                      If both clusters are healthy and exactly one is writable, the
+                      controller transitions back to Monitoring automatically.
+                      0 (default) disables periodic auto-recovery; use the
+                      mysql.keeper.io/recover-degraded annotation for manual one-shot recovery.
+                    type: string
+                type: object
               remoteKubeAPI:
                 description: |-
                   RemoteKubeAPI configures access to the remote cluster's Kubernetes API server.
@@ -478,15 +510,95 @@ spec:
                   the new source during a flip, and the channel the controller will
                   (re)activate when this cluster is demoted back to replica.
 
-
                   For symmetric setups (same channel name both directions) this field
                   alone is enough; leave PeerReplicationChannelName unset and the
                   controller will use this value for both sides.
 
-
                   Must match the channel name configured in the PerconaXtraDBCluster
                   CRD on both sites.
                 type: string
+              replicationErrorHandling:
+                description: |-
+                  ReplicationErrorHandling configures detection and optional auto-skip
+                  of replication apply errors on the local replica channel.
+                  When omitted, defaults to enabled with a conservative whitelist
+                  ([1062 duplicate-key, 1032 row-not-found]) and tight rate limits.
+                properties:
+                  autoSkip:
+                    description: |-
+                      AutoSkip configures automatic skipping of failing replicated
+                      transactions via empty-transaction injection (gtid_next=<failed>;
+                      BEGIN; COMMIT;). When omitted, defaults are: enabled, whitelist
+                      [1062, 1032], MaxSkipsPerWindow=3 over 10m, MaxSkipBeforeQuarantine=5
+                      over 1h, dry-run off.
+                    properties:
+                      dryRun:
+                        default: false
+                        description: |-
+                          DryRun, when true, performs all detection and rate-limit/whitelist
+                          evaluation but emits "WouldSkipTransaction" events instead of running
+                          the actual SQL skip. Useful for validating configuration on a new
+                          cluster before allowing any data divergence.
+                        type: boolean
+                      enabled:
+                        default: true
+                        description: |-
+                          Enabled toggles auto-skip globally for this policy. Detection and
+                          alarming continue to run regardless of this value.
+                        type: boolean
+                      errorCodeWhitelist:
+                        default:
+                        - 1062
+                        - 1032
+                        description: |-
+                          ErrorCodeWhitelist enumerates the MySQL error numbers eligible for
+                          auto-skip. Errors outside this list always alarm but never skip.
+                          Conservative defaults: 1062 (duplicate key) and 1032 (row not found
+                          on update/delete). Schema-drift errors such as 1146 (table missing)
+                          are intentionally excluded.
+                        items:
+                          format: int32
+                          type: integer
+                        type: array
+                      maxSkipBeforeQuarantine:
+                        default: 5
+                        description: |-
+                          MaxSkipBeforeQuarantine is the threshold over QuarantineWindow above
+                          which the replica is marked quarantined and switchover/promote is
+                          blocked by the C12 preflight check.
+                          Must be >= MaxSkipsPerWindow so rate-limit fires first.
+                        format: int32
+                        type: integer
+                      maxSkipsPerWindow:
+                        default: 3
+                        description: |-
+                          MaxSkipsPerWindow is the maximum number of skips allowed inside Window
+                          before further skips are blocked (rate-limit). The replica is not yet
+                          quarantined at this point.
+                        format: int32
+                        type: integer
+                      quarantineWindow:
+                        default: 1h
+                        description: |-
+                          QuarantineWindow is the rolling window used for MaxSkipBeforeQuarantine.
+                          Typically larger than Window.
+                        type: string
+                      window:
+                        default: 10m
+                        description: Window is the rolling rate-limit window for MaxSkipsPerWindow.
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                  gtidGapAlertThreshold:
+                    default: 0
+                    description: |-
+                      GTIDGapAlertThreshold raises an alarm (event + metric + condition) when
+                      the number of GTID transactions the replica is missing from the source
+                      exceeds this value. 0 (default) disables this alarm.
+                    format: int64
+                    type: integer
+                type: object
               switchover:
                 description: Switchover defines parameters for the switchover operation.
                 properties:
@@ -512,6 +624,8 @@ spec:
                       or demote a cluster by patching spec.replication.channels[].isSource on
                       the PerconaXtraDBCluster CRD before falling back to direct SQL queries.
                       0 (default) disables the CRD-first path and uses direct SQL only.
+                      Only effective in the non-MANO case when a k8s client is available for
+                      the target cluster (local always; remote requires spec.remoteKubeAPI).
                     format: int32
                     type: integer
                   drainTimeout:
@@ -576,20 +690,6 @@ spec:
                 - remoteWriterPort
                 - timeout
                 type: object
-              recovery:
-                description: Recovery configures how the controller attempts to exit
-                  the Degraded phase.
-                properties:
-                  autoRecoveryInterval:
-                    description: |-
-                      AutoRecoveryInterval, when positive, causes the controller to
-                      periodically re-evaluate cluster health while in Degraded phase.
-                      If both clusters are healthy and exactly one is writable, the
-                      controller transitions back to Monitoring automatically.
-                      0 (default) disables periodic auto-recovery; use the
-                      mysql.keeper.io/recover-degraded annotation for manual one-shot recovery.
-                    type: string
-                type: object
             required:
             - autoFailover
             - clusterRole
@@ -615,16 +715,8 @@ spec:
               conditions:
                 description: Conditions provides detailed status conditions.
                 items:
-                  description: "Condition contains details for one aspect of the current
-                    state of this API Resource.\n---\nThis struct is intended for
-                    direct use as an array at the field path .status.conditions.  For
-                    example,\n\n\n\ttype FooStatus struct{\n\t    // Represents the
-                    observations of a foo's current state.\n\t    // Known .status.conditions.type
-                    are: \"Available\", \"Progressing\", and \"Degraded\"\n\t    //
-                    +patchMergeKey=type\n\t    // +patchStrategy=merge\n\t    // +listType=map\n\t
-                    \   // +listMapKey=type\n\t    Conditions []metav1.Condition `json:\"conditions,omitempty\"
-                    patchStrategy:\"merge\" patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`\n\n\n\t
-                    \   // other fields\n\t}"
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
                   properties:
                     lastTransitionTime:
                       description: |-
@@ -665,12 +757,7 @@ spec:
                       - Unknown
                       type: string
                     type:
-                      description: |-
-                        type of condition in CamelCase or in foo.example.com/CamelCase.
-                        ---
-                        Many .condition.type values are consistent across resources like Available, but because arbitrary conditions can be
-                        useful (see .node.status.conditions), the ability to deconflict is important.
-                        The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
                       maxLength: 316
                       pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
                       type: string
@@ -705,11 +792,60 @@ spec:
                 type: integer
               consecutiveRemoteUnreachable:
                 description: |-
-                  ConsecutiveRemoteUnreachable counts how many successive health check cycles
-                  found the remote MySQL TCP-unreachable (WritableUnknown). Resets to zero
-                  as soon as the remote responds. Drives the remoteUnreachableThreshold gate.
+                  ConsecutiveRemoteUnreachable counts how many successive health check
+                  cycles were unable to reach the remote cluster at all (TCP-level failure).
+                  When this counter reaches spec.healthCheck.remoteUnreachableThreshold and
+                  AllowDataLossFailover=true, the controller promotes the local cluster.
                 format: int32
                 type: integer
+              gtidLag:
+                description: |-
+                  GTIDLag is the most recent replication-lag measurement between the
+                  source cluster and its replica. Updated every reconcile when a
+                  replication channel is configured. Use this for quick visibility via
+                  "kubectl describe" without reading Prometheus.
+                properties:
+                  lagSeconds:
+                    description: |-
+                      LagSeconds is the estimated lag derived from the ORIGINAL_COMMIT_TIMESTAMP
+                      of the last applied transaction on the replica. -1 means no data was
+                      available (channel idle, not yet configured, or no transactions replicated).
+                    format: int64
+                    type: integer
+                  localGTIDExecuted:
+                    description: |-
+                      LocalGTIDExecuted is the raw @@GLOBAL.gtid_executed string from the
+                      local (source) cluster at the time of this measurement. Refreshed every
+                      health-check interval so operators can compare it directly against a live
+                      MySQL query without waiting for a switchover.
+                    type: string
+                  measuredAt:
+                    description: MeasuredAt is when this measurement was collected.
+                    format: date-time
+                    type: string
+                  missingTransactions:
+                    description: |-
+                      MissingTransactions is the number of GTID transactions present on the
+                      source that the replica has not yet applied (GTID_SUBTRACT count).
+                    format: int64
+                    type: integer
+                  remoteGTIDMissing:
+                    description: |-
+                      RemoteGTIDExecuted is the GTID set the remote (replica) cluster is still
+                      missing from the source, expressed as GTID_SUBTRACT(local, remote).
+                      An empty string means the replica is fully caught up.
+                    type: string
+                required:
+                - lagSeconds
+                - measuredAt
+                - missingTransactions
+                type: object
+              lastDegradedRecoveryAttempt:
+                description: |-
+                  LastDegradedRecoveryAttempt is when the controller last evaluated whether
+                  it could exit the Degraded phase (annotation-triggered or automatic).
+                format: date-time
+                type: string
               lastPreFlight:
                 description: |-
                   LastPreFlight holds the checklist result of the most recent switchover
@@ -750,16 +886,11 @@ spec:
                 required:
                 - passedAt
                 type: object
-              lastDegradedRecoveryAttempt:
-                description: LastDegradedRecoveryAttempt is when the controller last
-                  evaluated whether it could exit the Degraded phase (annotation-triggered
-                  or automatic).
-                format: date-time
-                type: string
               lastRecoveryAnnotation:
-                description: LastRecoveryAnnotation tracks the annotation value from
-                  mysql.keeper.io/recover-degraded that was last processed. A change
-                  in the annotation value while Phase == Degraded fires an immediate
+                description: |-
+                  LastRecoveryAnnotation tracks the annotation value from
+                  mysql.keeper.io/recover-degraded that was last processed. A change in
+                  the annotation value while Phase == Degraded fires an immediate
                   recovery evaluation.
                 type: string
               lastSwitchoverReason:
@@ -811,41 +942,6 @@ spec:
                     description: WsrepClusterStatus is the reported Galera status
                       string (e.g. "Primary").
                     type: string
-                type: object
-              gtidLag:
-                description: GTIDLag is the most recent replication-lag measurement,
-                  refreshed every health-check interval.
-                properties:
-                  lagSeconds:
-                    description: |-
-                      LagSeconds is the estimated lag derived from ORIGINAL_COMMIT_TIMESTAMP
-                      of the last applied transaction on the replica. -1 means unavailable.
-                    format: int64
-                    type: integer
-                  localGTIDExecuted:
-                    description: |-
-                      LocalGTIDExecuted is the raw @@GLOBAL.gtid_executed from the local
-                      (source) cluster at measurement time. Refreshed every health-check
-                      interval so operators can compare directly against a live MySQL query.
-                    type: string
-                  measuredAt:
-                    description: MeasuredAt is when this measurement was collected.
-                    format: date-time
-                    type: string
-                  missingTransactions:
-                    description: MissingTransactions is the GTID_SUBTRACT count of
-                      transactions the replica has not yet applied.
-                    format: int64
-                    type: integer
-                  remoteGTIDMissing:
-                    description: |-
-                      RemoteGTIDMissing is the GTID set the remote replica is still missing
-                      (GTID_SUBTRACT(local, remote)). Empty string means fully caught up.
-                    type: string
-                required:
-                - lagSeconds
-                - measuredAt
-                - missingTransactions
                 type: object
               observedGeneration:
                 description: ObservedGeneration is the last spec generation the controller
@@ -902,6 +998,113 @@ spec:
                     description: WsrepClusterStatus is the reported Galera status
                       string (e.g. "Primary").
                     type: string
+                type: object
+              replicationErrors:
+                description: |-
+                  ReplicationErrors summarises the most recent replication apply error,
+                  the history of auto-skipped transactions, and the quarantine state of
+                  the local replica. Populated by the replication-error reconciler when
+                  spec.replicationErrorHandling is enabled (default).
+                properties:
+                  lastClearAnnotationValue:
+                    description: |-
+                      LastClearAnnotationValue is the most recent value of the
+                      mysql.keeper.io/clear-quarantine annotation that has been processed by
+                      the controller. A change in the annotation value while the replica is
+                      quarantined and currently healthy fires a one-shot quarantine clear.
+                    type: string
+                  lastError:
+                    description: |-
+                      LastError is the most recently observed SQL apply error that has not
+                      yet been skipped or cleared. Empty when the replica is healthy.
+                    properties:
+                      channel:
+                        description: Channel is the replication channel name that
+                          reported the error.
+                        type: string
+                      errno:
+                        description: Errno is the MySQL error number reported by the
+                          applier.
+                        format: int32
+                        type: integer
+                      gtid:
+                        description: |-
+                          GTID is the failed transaction's GTID when known. Empty if the
+                          controller could not determine it from performance_schema.
+                        type: string
+                      message:
+                        description: Message is the MySQL error message reported by
+                          the applier.
+                        type: string
+                      observedAt:
+                        description: |-
+                          ObservedAt is when the controller first observed this error in the
+                          current incident (cleared when the error resolves).
+                        format: date-time
+                        type: string
+                      workerID:
+                        description: |-
+                          WorkerID is the performance_schema worker id; 0 for single-thread
+                          applier or coordinator-only setups.
+                        format: int32
+                        type: integer
+                    required:
+                    - channel
+                    - errno
+                    - message
+                    - observedAt
+                    type: object
+                  quarantineReason:
+                    description: |-
+                      QuarantineReason captures the trigger that put the replica into
+                      quarantine, e.g. "skip count 6 exceeded threshold 5 in window 1h".
+                    type: string
+                  quarantinedSince:
+                    description: |-
+                      QuarantinedSince is set when the replica enters quarantine and
+                      cleared when an operator clears the quarantine via the
+                      mysql.keeper.io/clear-quarantine annotation.
+                    format: date-time
+                    type: string
+                  skippedTransactions:
+                    description: |-
+                      SkippedTransactions is a bounded history (capped at 50 entries) of
+                      transactions the controller has auto-skipped, in chronological order.
+                      Used for rate-limit and quarantine accounting and for operator audit.
+                    items:
+                      description: SkippedTransaction records one auto-skipped transaction.
+                      properties:
+                        dryRun:
+                          description: |-
+                            DryRun is true when the entry was logged in DryRun mode without
+                            actually injecting the empty transaction.
+                          type: boolean
+                        errno:
+                          description: Errno is the MySQL error number that triggered
+                            the skip.
+                          format: int32
+                          type: integer
+                        gtid:
+                          description: |-
+                            GTID is the transaction GTID that was skipped (or would have been
+                            skipped, if DryRun=true).
+                          type: string
+                        message:
+                          description: Message is the originating error message at
+                            the time of skip.
+                          type: string
+                        skippedAt:
+                          description: |-
+                            SkippedAt is when the skip was performed (or would have been performed
+                            in DryRun mode).
+                          format: date-time
+                          type: string
+                      required:
+                      - errno
+                      - gtid
+                      - skippedAt
+                      type: object
+                    type: array
                 type: object
               switchoverProgress:
                 description: |-

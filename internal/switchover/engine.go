@@ -195,6 +195,14 @@ type Config struct {
 	// false, a preflight without a readable local snapshot fails the switchover.
 	AllowDataLossFailover bool
 
+	// LocalReplicaQuarantined is forwarded into the C12 preflight check.
+	// True when status.replicationErrors.quarantinedSince is set on the CR.
+	LocalReplicaQuarantined bool
+
+	// LocalQuarantineReason is the reason text for C12, copied from
+	// status.replicationErrors.quarantineReason.
+	LocalQuarantineReason string
+
 	// Reason is a human-readable description surfaced in logs and events.
 	Reason string
 
@@ -358,6 +366,8 @@ func (e *Engine) phasePreFlight(ctx context.Context) (*PreFlightResult, error) {
 		CatchupTimeout:           e.cfg.CatchupTimeout,
 		MinBinlogRetentionSecond: e.cfg.MinBinlogRetentionSeconds,
 		AllowDataLossFailover:    e.cfg.AllowDataLossFailover,
+		LocalReplicaQuarantined:  e.cfg.LocalReplicaQuarantined,
+		LocalQuarantineReason:    e.cfg.LocalQuarantineReason,
 	}
 	res := p.Run(ctx)
 	if !res.OK() {

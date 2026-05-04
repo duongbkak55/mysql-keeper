@@ -183,6 +183,7 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	r.updateMetrics(policy, localHealth, remoteHealth)
 	r.observeReplicationMetrics(ctx, policy, comps)
 	gtidMissing, gtidLagSec, gtidLocalExecuted, gtidMissingSet, gtidMeasured := r.observeGTIDLag(ctx, policy, comps)
+	replErrOutcome := r.observeReplicationErrors(ctx, policy, comps, gtidMissing, gtidMeasured)
 
 	// Persist the counters/health derived from this cycle before any further
 	// branching. We keep the merge base cloned before we mutate the status so
@@ -193,6 +194,7 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	if gtidMeasured {
 		policy.Status.GTIDLag = gtidLagStatusFor(gtidMissing, gtidLagSec, gtidLocalExecuted, gtidMissingSet)
 	}
+	updateReplicationErrorStatus(policy, replErrOutcome, time.Now())
 	if err := r.Status().Patch(ctx, policy, healthPatch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch health status: %w", err)
 	}
@@ -450,6 +452,8 @@ func (r *ClusterSwitchPolicyReconciler) executeSwitchover(
 		DrainTimeout:              sw.DrainTimeout.Duration,
 		FenceTimeout:              sw.FenceTimeout.Duration,
 		AllowDataLossFailover:     policy.Spec.AllowDataLossFailover,
+		LocalReplicaQuarantined:   replicaQuarantined(policy),
+		LocalQuarantineReason:     replicaQuarantineReason(policy),
 		Reason:                    reason,
 		AttemptID:                 attemptID,
 		Progress:                  reporter,

@@ -357,6 +357,44 @@ Key metrics:
 - `mysql_keeper_cluster_healthy{cluster="local|remote"}` — health gauge
 - `mysql_keeper_switchover_total{result="success|failed|rolledback"}` — switchover counter
 - `mysql_keeper_consecutive_failures{cluster="local|remote"}` — failure streak gauge
+- `mysql_keeper_replication_error{cluster_role,channel,errno}` — 1 while a SQL applier error is firing
+- `mysql_keeper_replication_skipped_total{cluster_role,errno}` — auto-skipped transactions counter
+- `mysql_keeper_replication_skip_blocked_total{cluster_role,reason}` — would-be skips that were blocked (`not_whitelisted` / `rate_limited` / `dry_run` / `quarantined`)
+- `mysql_keeper_replica_quarantined{cluster_role}` — 1 when PreFlight C12 is blocking promote
+
+---
+
+## Replication Error Handling
+
+mysql-keeper detects SQL apply errors and GTID gaps on the local replica and
+optionally auto-skips whitelisted errors so replication can continue without
+operator intervention. Repeated skips trip a quarantine guard that blocks
+promote (PreFlight C12) until cleared via annotation.
+
+Default config (production-safe):
+
+```yaml
+spec:
+  replicationErrorHandling:
+    autoSkip:
+      enabled: true
+      errorCodeWhitelist: [1062, 1032]   # duplicate key + row not found
+      maxSkipsPerWindow: 3
+      window: 10m
+      maxSkipBeforeQuarantine: 5
+      quarantineWindow: 1h
+```
+
+Clear quarantine after operator review:
+
+```bash
+kubectl annotate clusterswitchpolicy <name> \
+  mysql.keeper.io/clear-quarantine="$(date -u +%FT%TZ)" --overwrite
+```
+
+See [`docs/replication-error-handling.md`](docs/replication-error-handling.md)
+for the full design (alarm sources, skip mechanism, failure modes,
+upgrade safety).
 
 ---
 

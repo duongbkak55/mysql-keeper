@@ -112,6 +112,16 @@ type PreFlight struct {
 	CatchupTimeout           time.Duration
 	MinBinlogRetentionSecond int64
 	AllowDataLossFailover    bool
+
+	// LocalReplicaQuarantined is true when the replication-error reconciler
+	// has flagged the local replica because the auto-skip count exceeded the
+	// configured threshold. C12 fails hard while this is true to prevent a
+	// quarantined replica being promoted to source.
+	LocalReplicaQuarantined bool
+
+	// LocalQuarantineReason is the human-readable reason copied from
+	// status.replicationErrors.quarantineReason for the C12 message.
+	LocalQuarantineReason string
 }
 
 // Run executes all checks. The caller decides whether to proceed based on
@@ -134,6 +144,7 @@ func (p PreFlight) Run(ctx context.Context) *PreFlightResult {
 	res.Checks = append(res.Checks, p.checkGTIDMode(ctx))
 	res.Checks = append(res.Checks, p.checkBinlogFormat(ctx))
 	res.Checks = append(res.Checks, p.checkBinlogRetention(ctx))
+	res.Checks = append(res.Checks, p.checkReplicaNotQuarantined())
 
 	for _, c := range res.Checks {
 		logger.Info("preflight check",
@@ -449,6 +460,30 @@ func (p PreFlight) checkBinlogRetention(ctx context.Context) CheckResult {
 	}
 	c.Passed = true
 	c.Message = fmt.Sprintf("binlog_expire_logs_seconds=%d (≥ %d)", snap.BinlogExpireLogsSeconds, minimum)
+	return withElapsed(c, start)
+}
+
+// checkReplicaNotQuarantined (C12) is a hard guard: a local replica that has
+// auto-skipped enough transactions to enter quarantine MUST NOT be promoted
+// to source until an operator has reviewed the divergence and cleared it via
+// the mysql.keeper.io/clear-quarantine annotation.
+//
+// The check is purely a status read — it does not query MySQL. The
+// replication-error reconciler is responsible for keeping LocalReplicaQuarantined
+// in sync with status.replicationErrors.quarantinedSince before phasePreFlight
+// runs.
+func (p PreFlight) checkReplicaNotQuarantined() CheckResult {
+	start := time.Now()
+	c := CheckResult{Name: "C12_ReplicaNotQuarantined", Severity: SeverityHard}
+	if !p.LocalReplicaQuarantined {
+		c.Passed = true
+		c.Message = "replica not quarantined"
+		return withElapsed(c, start)
+	}
+	c.Message = fmt.Sprintf(
+		"local replica is quarantined (%s) — clear via annotation %s before promote",
+		strings.TrimSpace(p.LocalQuarantineReason),
+		"mysql.keeper.io/clear-quarantine")
 	return withElapsed(c, start)
 }
 

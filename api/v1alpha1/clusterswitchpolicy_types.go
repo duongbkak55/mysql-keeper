@@ -134,6 +134,13 @@ type ClusterSwitchPolicySpec struct {
 	// Recovery configures how the controller attempts to exit the Degraded phase.
 	// +optional
 	Recovery RecoveryConfig `json:"recovery,omitempty"`
+
+	// ReplicationErrorHandling configures detection and optional auto-skip
+	// of replication apply errors on the local replica channel.
+	// When omitted, defaults to enabled with a conservative whitelist
+	// ([1062 duplicate-key, 1032 row-not-found]) and tight rate limits.
+	// +optional
+	ReplicationErrorHandling *ReplicationErrorHandlingConfig `json:"replicationErrorHandling,omitempty"`
 }
 
 // MANOConfig configures the MANO LCM API for toggling isSource on PXC CNFs.
@@ -475,6 +482,13 @@ type ClusterSwitchPolicyStatus struct {
 	// +optional
 	GTIDLag *GTIDLagStatus `json:"gtidLag,omitempty"`
 
+	// ReplicationErrors summarises the most recent replication apply error,
+	// the history of auto-skipped transactions, and the quarantine state of
+	// the local replica. Populated by the replication-error reconciler when
+	// spec.replicationErrorHandling is enabled (default).
+	// +optional
+	ReplicationErrors *ReplicationErrorStatus `json:"replicationErrors,omitempty"`
+
 	// ObservedGeneration is the last spec generation the controller processed.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
@@ -641,6 +655,160 @@ type RecoveryConfig struct {
 	AutoRecoveryInterval metav1.Duration `json:"autoRecoveryInterval,omitempty"`
 }
 
+// ReplicationErrorHandlingConfig configures detection and optional auto-skip
+// of replication apply errors on the local replica channel.
+type ReplicationErrorHandlingConfig struct {
+	// GTIDGapAlertThreshold raises an alarm (event + metric + condition) when
+	// the number of GTID transactions the replica is missing from the source
+	// exceeds this value. 0 (default) disables this alarm.
+	// +kubebuilder:default=0
+	// +optional
+	GTIDGapAlertThreshold int64 `json:"gtidGapAlertThreshold,omitempty"`
+
+	// AutoSkip configures automatic skipping of failing replicated
+	// transactions via empty-transaction injection (gtid_next=<failed>;
+	// BEGIN; COMMIT;). When omitted, defaults are: enabled, whitelist
+	// [1062, 1032], MaxSkipsPerWindow=3 over 10m, MaxSkipBeforeQuarantine=5
+	// over 1h, dry-run off.
+	// +optional
+	AutoSkip AutoSkipConfig `json:"autoSkip,omitempty"`
+}
+
+// AutoSkipConfig controls the rate-limited, whitelist-gated auto-skip path.
+// All thresholds must satisfy MaxSkipsPerWindow <= MaxSkipBeforeQuarantine so
+// that the soft rate-limit fires before the hard quarantine guard.
+type AutoSkipConfig struct {
+	// Enabled toggles auto-skip globally for this policy. Detection and
+	// alarming continue to run regardless of this value.
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled"`
+
+	// DryRun, when true, performs all detection and rate-limit/whitelist
+	// evaluation but emits "WouldSkipTransaction" events instead of running
+	// the actual SQL skip. Useful for validating configuration on a new
+	// cluster before allowing any data divergence.
+	// +kubebuilder:default=false
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
+
+	// ErrorCodeWhitelist enumerates the MySQL error numbers eligible for
+	// auto-skip. Errors outside this list always alarm but never skip.
+	// Conservative defaults: 1062 (duplicate key) and 1032 (row not found
+	// on update/delete). Schema-drift errors such as 1146 (table missing)
+	// are intentionally excluded.
+	// +kubebuilder:default={1062,1032}
+	// +optional
+	ErrorCodeWhitelist []int32 `json:"errorCodeWhitelist,omitempty"`
+
+	// MaxSkipsPerWindow is the maximum number of skips allowed inside Window
+	// before further skips are blocked (rate-limit). The replica is not yet
+	// quarantined at this point.
+	// +kubebuilder:default=3
+	// +optional
+	MaxSkipsPerWindow int32 `json:"maxSkipsPerWindow,omitempty"`
+
+	// Window is the rolling rate-limit window for MaxSkipsPerWindow.
+	// +kubebuilder:default="10m"
+	// +optional
+	Window metav1.Duration `json:"window,omitempty"`
+
+	// MaxSkipBeforeQuarantine is the threshold over QuarantineWindow above
+	// which the replica is marked quarantined and switchover/promote is
+	// blocked by the C12 preflight check.
+	// Must be >= MaxSkipsPerWindow so rate-limit fires first.
+	// +kubebuilder:default=5
+	// +optional
+	MaxSkipBeforeQuarantine int32 `json:"maxSkipBeforeQuarantine,omitempty"`
+
+	// QuarantineWindow is the rolling window used for MaxSkipBeforeQuarantine.
+	// Typically larger than Window.
+	// +kubebuilder:default="1h"
+	// +optional
+	QuarantineWindow metav1.Duration `json:"quarantineWindow,omitempty"`
+}
+
+// ReplicationErrorStatus reports replication apply error state on the local
+// replica channel and records the history of auto-skipped transactions.
+type ReplicationErrorStatus struct {
+	// LastError is the most recently observed SQL apply error that has not
+	// yet been skipped or cleared. Empty when the replica is healthy.
+	// +optional
+	LastError *ReplicationErrorEntry `json:"lastError,omitempty"`
+
+	// SkippedTransactions is a bounded history (capped at 50 entries) of
+	// transactions the controller has auto-skipped, in chronological order.
+	// Used for rate-limit and quarantine accounting and for operator audit.
+	// +optional
+	SkippedTransactions []SkippedTransaction `json:"skippedTransactions,omitempty"`
+
+	// QuarantinedSince is set when the replica enters quarantine and
+	// cleared when an operator clears the quarantine via the
+	// mysql.keeper.io/clear-quarantine annotation.
+	// +optional
+	QuarantinedSince *metav1.Time `json:"quarantinedSince,omitempty"`
+
+	// QuarantineReason captures the trigger that put the replica into
+	// quarantine, e.g. "skip count 6 exceeded threshold 5 in window 1h".
+	// +optional
+	QuarantineReason string `json:"quarantineReason,omitempty"`
+
+	// LastClearAnnotationValue is the most recent value of the
+	// mysql.keeper.io/clear-quarantine annotation that has been processed by
+	// the controller. A change in the annotation value while the replica is
+	// quarantined and currently healthy fires a one-shot quarantine clear.
+	// +optional
+	LastClearAnnotationValue string `json:"lastClearAnnotationValue,omitempty"`
+}
+
+// ReplicationErrorEntry describes a single replication apply error.
+type ReplicationErrorEntry struct {
+	// Channel is the replication channel name that reported the error.
+	Channel string `json:"channel"`
+
+	// WorkerID is the performance_schema worker id; 0 for single-thread
+	// applier or coordinator-only setups.
+	// +optional
+	WorkerID int32 `json:"workerID,omitempty"`
+
+	// GTID is the failed transaction's GTID when known. Empty if the
+	// controller could not determine it from performance_schema.
+	// +optional
+	GTID string `json:"gtid,omitempty"`
+
+	// Errno is the MySQL error number reported by the applier.
+	Errno int32 `json:"errno"`
+
+	// Message is the MySQL error message reported by the applier.
+	Message string `json:"message"`
+
+	// ObservedAt is when the controller first observed this error in the
+	// current incident (cleared when the error resolves).
+	ObservedAt metav1.Time `json:"observedAt"`
+}
+
+// SkippedTransaction records one auto-skipped transaction.
+type SkippedTransaction struct {
+	// GTID is the transaction GTID that was skipped (or would have been
+	// skipped, if DryRun=true).
+	GTID string `json:"gtid"`
+
+	// Errno is the MySQL error number that triggered the skip.
+	Errno int32 `json:"errno"`
+
+	// Message is the originating error message at the time of skip.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// SkippedAt is when the skip was performed (or would have been performed
+	// in DryRun mode).
+	SkippedAt metav1.Time `json:"skippedAt"`
+
+	// DryRun is true when the entry was logged in DryRun mode without
+	// actually injecting the empty transaction.
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
+}
+
 // Phase constants.
 const (
 	PhaseInitializing  = "Initializing"
@@ -657,6 +825,18 @@ const (
 	ConditionRemoteHealthy       = "RemoteClusterHealthy"
 	ConditionSwitchoverInProgress = "SwitchoverInProgress"
 	ConditionSplitBrainSafe      = "SplitBrainSafe"
+	ConditionReplicationHealthy   = "ReplicationHealthy"
+	ConditionReplicaQuarantined   = "ReplicaQuarantined"
+)
+
+// Annotation keys.
+const (
+	// AnnotationClearQuarantine, when changed, asks the controller to
+	// re-evaluate replica quarantine state and clear it if the replica is
+	// no longer reporting errors and skip history is below threshold.
+	// The controller persists the last-processed value in status to
+	// recognise changes across restarts.
+	AnnotationClearQuarantine = "mysql.keeper.io/clear-quarantine"
 )
 
 // ClusterRole constants.

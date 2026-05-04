@@ -195,6 +195,58 @@ var (
 		},
 		[]string{"cluster_role", "channel"},
 	)
+
+	// ReplicationError is 1 while at least one worker on the channel reports
+	// LAST_ERROR_NUMBER == errno, 0 once the error clears. The errno label lets
+	// alerts distinguish whitelisted-skip-eligible errors (1062, 1032) from
+	// schema-drift errors (1146, 1054) at PromQL time.
+	// Labels: cluster_role, channel, errno
+	ReplicationError = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replication_error",
+			Help:      "1 while the replica reports a SQL apply error with the given errno on the channel; 0 when cleared.",
+		},
+		[]string{"cluster_role", "channel", "errno"},
+	)
+
+	// ReplicationSkippedTotal counts auto-skipped transactions by errno.
+	// Includes DryRun-mode would-be skips so dashboards can compare projected
+	// vs actual skip volume.
+	// Labels: cluster_role, errno
+	ReplicationSkippedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replication_skipped_total",
+			Help:      "Number of replication transactions auto-skipped by the controller (includes dry-run).",
+		},
+		[]string{"cluster_role", "errno"},
+	)
+
+	// ReplicationSkipBlockedTotal counts cases where a skip-eligible error was
+	// detected but skip was suppressed. Reason ∈ {not_whitelisted, rate_limited,
+	// dry_run, quarantined, disabled, missing_gtid, not_leader}.
+	// Labels: cluster_role, reason
+	ReplicationSkipBlockedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replication_skip_blocked_total",
+			Help:      "Number of would-be auto-skips that were blocked, by reason.",
+		},
+		[]string{"cluster_role", "reason"},
+	)
+
+	// ReplicaQuarantined is 1 while the local replica is quarantined and the
+	// PreFlight C12 check is blocking promote, 0 otherwise.
+	// Labels: cluster_role
+	ReplicaQuarantined = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mysql_keeper",
+			Name:      "replica_quarantined",
+			Help:      "1 when the local replica is quarantined (skip count exceeded threshold); 0 otherwise.",
+		},
+		[]string{"cluster_role"},
+	)
 )
 
 func init() {
@@ -216,6 +268,10 @@ func init() {
 		BinlogExpireLogsSeconds,
 		GTIDMissingTransactions,
 		ReplicationLagSeconds,
+		ReplicationError,
+		ReplicationSkippedTotal,
+		ReplicationSkipBlockedTotal,
+		ReplicaQuarantined,
 	)
 
 	// Pre-seed GaugeVec label combinations so every process exposes the
@@ -230,5 +286,6 @@ func init() {
 			ConsecutiveFailures.WithLabelValues(role, scope).Set(0)
 		}
 		ProxySQLHealthyInstances.WithLabelValues(role).Set(0)
+		ReplicaQuarantined.WithLabelValues(role).Set(0)
 	}
 }
