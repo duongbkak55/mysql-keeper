@@ -190,7 +190,7 @@ func (r *ClusterSwitchPolicyReconciler) Reconcile(ctx context.Context, req ctrl.
 	r.updateMetrics(policy, localHealth, remoteHealth)
 	r.observeReplicationMetrics(ctx, policy, comps)
 	gtidMissing, gtidLagSec, gtidLocalExecuted, gtidMissingSet, gtidMeasured := r.observeGTIDLag(ctx, policy, comps)
-	replErrOutcome := r.observeReplicationErrors(ctx, policy, comps, gtidMissing, gtidMeasured)
+	replErrOutcome := r.observeReplicationErrors(ctx, policy, comps, localHealth, gtidMissing, gtidMeasured)
 
 	// Persist the counters/health derived from this cycle before any further
 	// branching. We keep the merge base cloned before we mutate the status so

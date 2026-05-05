@@ -292,16 +292,21 @@ func (m *Manager) DetectWorkerErrors(ctx context.Context, channel string) ([]Wor
 	qCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
-	// Worker-level rows. MTS exposes one row per worker; LAST_PROCESSED_TRANSACTION
-	// is the GTID currently being applied (i.e. the failing one) when the worker
-	// is in error. LAST_APPLIED_TRANSACTION is the GTID of the last txn that
-	// succeeded — different field, do not confuse.
+	// Worker-level rows. MTS exposes one row per worker; APPLYING_TRANSACTION
+	// is the GTID currently being applied by the worker (i.e. the failing
+	// one when LAST_ERROR_NUMBER > 0 — the worker is stuck on it).
+	// LAST_APPLIED_TRANSACTION is the GTID of the last txn that succeeded
+	// before the failure — different field, do not confuse.
+	//
+	// Note: the coordinator view exposes LAST_PROCESSED_TRANSACTION for the
+	// row it most recently dispatched to a worker, which is a different
+	// concept and does not exist on the worker view.
 	rows, err := db.QueryContext(qCtx, `
 		SELECT
 			WORKER_ID,
 			LAST_ERROR_NUMBER,
 			COALESCE(LAST_ERROR_MESSAGE, ''),
-			COALESCE(LAST_PROCESSED_TRANSACTION, ''),
+			COALESCE(APPLYING_TRANSACTION, ''),
 			LAST_ERROR_TIMESTAMP
 		FROM performance_schema.replication_applier_status_by_worker
 		WHERE CHANNEL_NAME = ? AND LAST_ERROR_NUMBER > 0`, channel)

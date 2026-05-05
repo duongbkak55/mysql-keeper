@@ -321,15 +321,20 @@ func init() {
 
 	// Pre-seed counter metrics so dashboards show "0" instead of "no data"
 	// for well-known label combinations from process startup.
+	//
+	// errno-labelled counters are seeded with the conservative skip whitelist
+	// (1062 duplicate-key, 1032 row-not-found) — non-whitelisted errnos
+	// dynamically appear on first occurrence. The empty-string sentinel
+	// previously used for the failed counter is replaced with these stable
+	// whitelist values so PromQL rate() doesn't have to filter sentinels.
 	for _, role := range []string{"dc", "dr"} {
-		// errno is dynamic (per MySQL error number); seed a blank sentinel so
-		// the series exists. Dynamic errno values will appear on first use.
-		ReplicationSkipFailedTotal.WithLabelValues(role, "").Add(0)
-
+		for _, errno := range []string{"1062", "1032"} {
+			ReplicationSkippedTotal.WithLabelValues(role, errno).Add(0)
+			ReplicationSkipFailedTotal.WithLabelValues(role, errno).Add(0)
+		}
 		for _, reason := range []string{"active_error", "burst_in_window"} {
 			QuarantineClearRefusedTotal.WithLabelValues(role, reason).Add(0)
 		}
-
 		for _, reason := range []string{"disabled", "not_whitelisted", "rate_limited", "dry_run", "quarantined", "missing_gtid", "unsupported_inspector"} {
 			ReplicationSkipBlockedTotal.WithLabelValues(role, reason).Add(0)
 		}

@@ -22,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
+	"github.com/duongnguyen/mysql-keeper/internal/health"
 	"github.com/duongnguyen/mysql-keeper/internal/metrics"
 	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
@@ -80,11 +81,19 @@ type replicationErrorOutcome struct {
 	RefusedClearReason string
 }
 
-// observeReplicationErrors runs after observeGTIDLag and before any
-// switchover branch. It detects SQL applier errors on the local replica
-// channel, optionally invokes the auto-skip path (P3), evaluates rate-limit
-// and quarantine thresholds, and returns an outcome the caller persists
-// alongside the health-status patch.
+// observeReplicationErrors runs after the cluster health check on every
+// reconcile cycle (cadence == spec.healthCheck.interval, default 15s).
+// It detects SQL applier errors on the local replica channel, optionally
+// invokes the auto-skip path (P3), evaluates rate-limit and quarantine
+// thresholds, and returns an outcome the caller persists alongside the
+// health-status patch.
+//
+// localHealth is the just-collected health snapshot for the local cluster.
+// When it reports WritableUnknown (i.e. the cluster did not respond to the
+// health probe at all), this function returns early without issuing any
+// performance_schema queries — those queries would only time out and
+// produce noisy debug logs while MySQL is unreachable. Detection resumes
+// automatically on the next reconcile once the cluster comes back.
 //
 // All side effects (events, metrics) are emitted from this function. The
 // caller is responsible for the status patch (via updateReplicationErrorStatus).
@@ -92,6 +101,7 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	ctx context.Context,
 	policy *mysqlv1alpha1.ClusterSwitchPolicy,
 	comps *componentSet,
+	localHealth health.ClusterHealth,
 	gtidMissing int64,
 	gtidMeasured bool,
 ) replicationErrorOutcome {
@@ -109,6 +119,38 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	}
 	role := policy.Spec.ClusterRole
 	logger := ctrl.LoggerFrom(ctx).WithValues("component", "replication-errors")
+
+	// Reachability gate — when the health check could not even read
+	// read_only on the local cluster, MySQL is effectively unreachable.
+	// Don't bother running performance_schema queries that will only time
+	// out; the next reconcile will retry once the probe comes back.
+	if localHealth.Writable == health.WritableUnknown {
+		logger.V(1).Info("replication_error_detection_skipped_unreachable",
+			"event", "replication_error_detection_skipped",
+			"cluster_role", role,
+			"channel", channel,
+			"reason", "local_unreachable",
+		)
+		return out
+	}
+
+	// Pre-seed the replication_error gauge for whitelisted errnos so the
+	// series appears in /metrics from the first reconcile cycle, regardless
+	// of whether any error has fired. Without this, Prometheus shows "no
+	// data" until an incident, which makes alerting rules harder to validate.
+	// The detection loop below sets the gauge to 1 for any errno actually
+	// observed; the diff-reset path zeroes errnos that previously fired.
+	preseedErrnos := cfg.AutoSkip.ErrorCodeWhitelist
+	if len(preseedErrnos) == 0 {
+		preseedErrnos = []int32{1062, 1032}
+	}
+	for _, errno := range preseedErrnos {
+		errnoStr := strconv.FormatInt(int64(errno), 10)
+		key := replicationErrorLabelKey(string(policy.UID), role, channel, errnoStr)
+		if _, alreadyActive := r.activeReplicationErrorLabels.Load(key); !alreadyActive {
+			metrics.ReplicationError.WithLabelValues(role, channel, errnoStr).Set(0)
+		}
+	}
 
 	// GTID gap alarm — alarm-only path, never triggers a skip. Threshold 0
 	// disables it. We deliberately keep this distinct from the existing
@@ -147,6 +189,14 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	// cycle so we can diff against activeReplicationErrorLabels and zero any
 	// gauge series that were "1" last cycle but are absent now.
 	currentLabels := map[string]struct{}{}
+	// newErrorEntries collects only the errors that are seeing their first
+	// observation in the current incident — i.e. their (errno) label was
+	// NOT in activeReplicationErrorLabels before this cycle. Used to debounce
+	// k8s event emission so `kubectl describe` is not flooded with the same
+	// Warning every reconcile while a long-running error persists. Logs
+	// (which go to ELK) and metrics (gauges) keep firing every cycle so the
+	// incident's duration stays observable.
+	var newErrorEntries []mysqlv1alpha1.ReplicationErrorEntry
 
 	now := time.Now()
 	for _, w := range workerErrs {
@@ -167,7 +217,12 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 		metrics.ReplicationError.WithLabelValues(role, channel, errnoStr).Set(1)
 		key := replicationErrorLabelKey(uid, role, channel, errnoStr)
 		currentLabels[key] = struct{}{}
-		r.activeReplicationErrorLabels.Store(key, struct{}{})
+		// LoadOrStore returns wasPresent=true when the key was already in the
+		// map from a prior cycle. We treat the inverse as "new error
+		// transition" worth alarming about.
+		if _, wasActive := r.activeReplicationErrorLabels.LoadOrStore(key, struct{}{}); !wasActive {
+			newErrorEntries = append(newErrorEntries, entry)
+		}
 		logger.Info("replication_sql_error",
 			"event", "replication_sql_error",
 			"cluster_role", role,
@@ -181,10 +236,17 @@ func (r *ClusterSwitchPolicyReconciler) observeReplicationErrors(
 	if len(out.AllErrors) > 0 {
 		first := out.AllErrors[0]
 		out.ActiveError = &first
-		if r.Recorder != nil {
+		// Debounce: only emit a k8s Warning when at least one of the
+		// observed errnos was NOT firing in the previous reconcile. Long-
+		// running incidents would otherwise flood `kubectl describe csp`
+		// with the same Warning every healthcheck.interval. The metric
+		// (gauge=1 every cycle) and the structured log already give ELK /
+		// Prometheus full coverage of the incident's duration.
+		if len(newErrorEntries) > 0 && r.Recorder != nil {
+			ne := newErrorEntries[0]
 			r.Recorder.Event(policy, corev1.EventTypeWarning, "ReplicationSQLError",
 				fmt.Sprintf("channel=%q worker=%d errno=%d gtid=%q: %s",
-					first.Channel, first.WorkerID, first.Errno, first.GTID, first.Message))
+					ne.Channel, ne.WorkerID, ne.Errno, ne.GTID, ne.Message))
 		}
 	}
 

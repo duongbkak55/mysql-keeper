@@ -2,19 +2,28 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	mysqlv1alpha1 "github.com/duongnguyen/mysql-keeper/api/v1alpha1"
+	"github.com/duongnguyen/mysql-keeper/internal/health"
 	"github.com/duongnguyen/mysql-keeper/internal/metrics"
 	"github.com/duongnguyen/mysql-keeper/internal/pxc"
 )
+
+// healthYes is the localHealth value tests pass when they want the
+// reachability gate in observeReplicationErrors to allow detection to run.
+// WritableUnknown would short-circuit the function before any
+// performance_schema query.
+var healthYes = health.ClusterHealth{Writable: health.WritableYes}
 
 // TestEffectiveReplicationErrorHandling_OmittedDefaults covers the upgrade
 // safety case (R5): an existing CR with no replicationErrorHandling field
@@ -273,13 +282,44 @@ func TestUpdateReplicationErrorStatus_AnnotationClearPersisted(t *testing.T) {
 	}
 }
 
+// fakeFullRecorder is a record.EventRecorder test double that captures
+// every Event / Eventf / AnnotatedEventf call so debounce tests can assert
+// counts by Reason.
+type fakeFullRecorder struct {
+	events []struct{ Type, Reason, Message string }
+}
+
+func (f *fakeFullRecorder) Event(_ runtime.Object, eventType, reason, message string) {
+	f.events = append(f.events,
+		struct{ Type, Reason, Message string }{eventType, reason, message})
+}
+func (f *fakeFullRecorder) Eventf(o runtime.Object, eventType, reason, messageFmt string, args ...interface{}) {
+	f.Event(o, eventType, reason, fmt.Sprintf(messageFmt, args...))
+}
+func (f *fakeFullRecorder) AnnotatedEventf(o runtime.Object, _ map[string]string, eventType, reason, messageFmt string, args ...interface{}) {
+	f.Event(o, eventType, reason, fmt.Sprintf(messageFmt, args...))
+}
+func (f *fakeFullRecorder) countByReason(reason string) int {
+	n := 0
+	for _, e := range f.events {
+		if e.Reason == reason {
+			n++
+		}
+	}
+	return n
+}
+
 // fakeDetector is a workerErrorDetector test double that returns a fixed slice
 // of WorkerErrors. Use nil errors slice to simulate "no errors this cycle".
+// callCount is incremented on every invocation so tests asserting the
+// reachability gate (i.e. detection must be skipped) can verify zero calls.
 type fakeDetector struct {
-	errs []pxc.WorkerError
+	errs      []pxc.WorkerError
+	callCount int
 }
 
 func (f *fakeDetector) DetectWorkerErrors(_ context.Context, _ string) ([]pxc.WorkerError, error) {
+	f.callCount++
 	return f.errs, nil
 }
 
@@ -352,7 +392,7 @@ func TestObserveReplicationErrors_StaleLabelsReset(t *testing.T) {
 	det := &fakeInspectorDetector{fakeDetector: fakeDetector{errs: nil}}
 	comps := &componentSet{localInspector: det}
 
-	r.observeReplicationErrors(context.Background(), policy, comps, 0, false)
+	r.observeReplicationErrors(context.Background(), policy, comps, healthYes, 0, false)
 
 	// Both stale gauges must be reset to 0.
 	if got := testutil.ToFloat64(metrics.ReplicationError.WithLabelValues(role, channel, "1062")); got != 0 {
@@ -368,6 +408,98 @@ func TestObserveReplicationErrors_StaleLabelsReset(t *testing.T) {
 	}
 	if _, ok := r.activeReplicationErrorLabels.Load(key1032); ok {
 		t.Errorf("key1032 should have been deleted from activeReplicationErrorLabels")
+	}
+}
+
+// TestObserveReplicationErrors_SkipDetectionWhenUnreachable verifies the
+// reachability gate: when localHealth.Writable == WritableUnknown the
+// reconciler must NOT issue any performance_schema queries — those would
+// only time out and produce noisy debug logs while MySQL is down.
+func TestObserveReplicationErrors_SkipDetectionWhenUnreachable(t *testing.T) {
+	policy := &mysqlv1alpha1.ClusterSwitchPolicy{
+		Spec: mysqlv1alpha1.ClusterSwitchPolicySpec{
+			ClusterRole:            "dc",
+			ReplicationChannelName: "dc-to-dr",
+		},
+	}
+	policy.UID = types.UID("ureach-1")
+
+	det := &fakeInspectorDetector{fakeDetector: fakeDetector{
+		errs: []pxc.WorkerError{{
+			Channel: "dc-to-dr", Errno: 1062, FailedGTID: "abc:1",
+			Message: "would not be observed", Timestamp: time.Now(),
+		}},
+	}}
+	comps := &componentSet{localInspector: det}
+
+	r := &ClusterSwitchPolicyReconciler{}
+	out := r.observeReplicationErrors(context.Background(), policy, comps,
+		health.ClusterHealth{Writable: health.WritableUnknown}, 0, false)
+
+	if len(out.AllErrors) != 0 {
+		t.Errorf("expected zero errors when local unreachable, got %v", out.AllErrors)
+	}
+	if det.callCount != 0 {
+		t.Errorf("expected DetectWorkerErrors NOT called when unreachable, got %d calls", det.callCount)
+	}
+}
+
+// TestObserveReplicationErrors_DebounceEventEmission verifies the
+// transition-only event behaviour: a Warning ReplicationSQLError fires on
+// the first observation of a given errno, but a subsequent reconcile that
+// observes the SAME errno still firing must NOT re-emit. The metric
+// (gauge=1) and structured log (one line per cycle) keep firing so ELK /
+// Prometheus can still observe duration.
+func TestObserveReplicationErrors_DebounceEventEmission(t *testing.T) {
+	policy := &mysqlv1alpha1.ClusterSwitchPolicy{
+		Spec: mysqlv1alpha1.ClusterSwitchPolicySpec{
+			ClusterRole:            "dc",
+			ReplicationChannelName: "dc-to-dr",
+		},
+	}
+	policy.UID = types.UID("debounce-1")
+
+	det := &fakeInspectorDetector{fakeDetector: fakeDetector{
+		errs: []pxc.WorkerError{{
+			Channel: "dc-to-dr", Errno: 1062, FailedGTID: "abc:1",
+			Message: "Duplicate entry", Timestamp: time.Now(),
+		}},
+	}}
+	comps := &componentSet{localInspector: det}
+	rec := &fakeFullRecorder{}
+	r := &ClusterSwitchPolicyReconciler{Recorder: rec}
+
+	// Cycle 1: first observation of errno=1062 → must emit Warning event.
+	r.observeReplicationErrors(context.Background(), policy, comps, healthYes, 0, false)
+	first := rec.countByReason("ReplicationSQLError")
+	if first != 1 {
+		t.Fatalf("cycle 1: expected 1 ReplicationSQLError event, got %d", first)
+	}
+
+	// Cycle 2: same errno still firing → must NOT emit a duplicate event.
+	r.observeReplicationErrors(context.Background(), policy, comps, healthYes, 0, false)
+	second := rec.countByReason("ReplicationSQLError")
+	if second != 1 {
+		t.Errorf("cycle 2: expected event to be debounced, got %d total", second)
+	}
+
+	// Cycle 3: error clears (detector returns no rows) → no new event.
+	det.fakeDetector.errs = nil
+	r.observeReplicationErrors(context.Background(), policy, comps, healthYes, 0, false)
+	third := rec.countByReason("ReplicationSQLError")
+	if third != 1 {
+		t.Errorf("cycle 3 (clear): expected total events still 1, got %d", third)
+	}
+
+	// Cycle 4: same errno fires again on a fresh incident → must re-emit.
+	det.fakeDetector.errs = []pxc.WorkerError{{
+		Channel: "dc-to-dr", Errno: 1062, FailedGTID: "abc:2",
+		Message: "Duplicate entry second incident", Timestamp: time.Now(),
+	}}
+	r.observeReplicationErrors(context.Background(), policy, comps, healthYes, 0, false)
+	fourth := rec.countByReason("ReplicationSQLError")
+	if fourth != 2 {
+		t.Errorf("cycle 4 (new incident): expected 2 total events, got %d", fourth)
 	}
 }
 
@@ -482,7 +614,7 @@ func TestReplicationErrorPipeline_SkipAndRecover(t *testing.T) {
 	// Instead, call observeReplicationErrors with a skipper-less component set
 	// so the internal applyAutoSkip gets an unsupported_inspector block, then
 	// call applyAutoSkipWith directly with the real fakeSkipper.
-	out := r.observeReplicationErrors(context.Background(), policy, comps1, 0, false)
+	out := r.observeReplicationErrors(context.Background(), policy, comps1, healthYes, 0, false)
 
 	// Step 2: apply skip explicitly (the testable inner path).
 	r.applyAutoSkipWith(context.Background(), policy, skipper1, cfg, &out, now)
@@ -522,7 +654,7 @@ func TestReplicationErrorPipeline_SkipAndRecover(t *testing.T) {
 	det2 := &fakeInspectorDetector{fakeDetector: fakeDetector{errs: nil}}
 	comps2 := &componentSet{localInspector: det2}
 
-	out2 := r.observeReplicationErrors(context.Background(), policy, comps2, 0, false)
+	out2 := r.observeReplicationErrors(context.Background(), policy, comps2, healthYes, 0, false)
 
 	// applyAutoSkipWith with no errors is a no-op for skipping, but
 	// evaluateQuarantine still runs (no quarantine expected here).
